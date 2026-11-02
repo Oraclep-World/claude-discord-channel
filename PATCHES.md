@@ -1,20 +1,11 @@
-# Discord plugin: the laris-co patch
+# The patch in detail
 
 The official `discord@claude-plugins-official` plugin listens only in channels listed one by one in
 `access.json`, and it never opens threads. The team wants this instead: **tag a bot in any room, and it
 answers in a thread on that message**. This folder keeps the code we run, so any machine can install it
 and anyone can compare it with upstream.
 
-```
-plugin/discord/
-  upstream-0.0.4/   the plugin exactly as shipped (server.ts, package.json, .mcp.json), for comparison
-  server.ts         what we run: upstream plus the patch below
-  laris-co.patch    diff -u upstream-0.0.4/server.ts server.ts
-```
-
-Install on a machine with `just plugin-patch`, then `/mcp` reconnect (or restart) each `--channels` session.
-`just plugin-patch check` only reports. The script replaces a cached `server.ts` only if it is upstream,
-a prior hand patch it knows about, or already ours. Anything else it leaves alone.
+See README.md for install. `laris-co.patch` is `diff -u` of upstream 0.0.4 `server.ts` against ours.
 
 ## What the patch adds (all opt-in in access.json)
 
@@ -54,7 +45,7 @@ a prior hand patch it knows about, or already ours. Anything else it leaves alon
 - `mirrorTo: ["machine:<herdr machine>:<abs path>", "<abs path>"]` (per policy, Nat 2026-11-02): also type a
   read-only copy of each delivered message into the agent whose cwd is that path (resolved at send time, like
   `forwardTo`, so it survives moves and restarts), for example the same oracle's body on white
-  (`machine:white-arraxccdc:/opt/Code/github.com/arraxccdc/arraxccdc-team`). Exact panes
+  (`machine:<label>:/abs/path/to/team-repo`). Exact panes
   (`machine:<label>:<pane>`, `<session>:<pane>`) also work. This body (or its `forwardTo` worktree) still answers. The copy is told not to post
   on Discord, so one bot still has one listener and gives one answer. It runs in the background with a 20 s limit, so an
   offline machine never delays the answer. Attachments are named only, because their files stay on this machine.
@@ -120,7 +111,7 @@ a prior hand patch it knows about, or already ours. Anything else it leaves alon
 - Every message reaches Claude with the room's name, `channel="#oracles"`, plus `thread="laris-labs-oracle"` when it comes
   from a thread (2026-10-31). The names are read from the channel objects discord.js already keeps for the gateway
   (renames update them), so there is no API call, no timer and no cache of our own.
-- A message that tags someone also carries their names, `mentions="<@1501944184276385842>=FireMan Oracle; <@&…>=@media-team"`
+- A message that tags someone also carries their names, `mentions="<@111111111111111111>=FireMan Oracle; <@&…>=@media-team"`
   (2026-10-31): every user, role and channel tagged in the text, from what discord.js already parsed out of the message.
   The content keeps the raw `<@id>`, so a bot can still tag back.
 - `deny: true` on a group means never listen there, even if the guild default would.
@@ -143,8 +134,8 @@ hear #media-team without a tag, and never read #บัญชี:
 ```yaml
 access:
   groups:
-    "1560861042622472343": { requireMention: false }
-    "1560860812602511472": { deny: true }
+    "222222222222222222": { requireMention: false }
+    "333333333333333333": { deny: true }
 ```
 
 ## Concerns and open questions

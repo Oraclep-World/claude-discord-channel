@@ -1,5 +1,5 @@
---- plugin/discord/upstream-0.0.4/server.ts	2026-11-02 16:44:43
-+++ plugin/discord/server.ts	2026-11-02 16:45:02
+--- upstream-0.0.4/server.ts
++++ server.ts
 @@ -22,20 +22,32 @@
    GatewayIntentBits,
    Partials,
@@ -93,7 +93,7 @@
    dmPolicy: 'pairing' | 'allowlist' | 'disabled'
 +  /** laris-co patch: the host oracle of this guild (written by access-sync). Only the host acts on "!!thread". */
 +  host?: boolean
-+  /** laris-co patch: the laris-team checkout (written by access-sync), for the !!setup name check. */
++  /** laris-co patch: the team checkout with oracles/<name>/config.yaml (written by access-sync), for the !!setup name check. */
 +  teamDir?: string
    allowFrom: string[]
    /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
@@ -175,13 +175,10 @@
    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
    const tmp = ACCESS_FILE + '.tmp'
    writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-@@ -230,9 +331,617 @@
-     // Sets iterate in insertion order — this drops the oldest.
-     const first = recentSentIds.values().next().value
-     if (first) recentSentIds.delete(first)
-+  }
-+}
-+
+@@ -233,6 +334,615 @@
+   }
+ }
+ 
 +// Find the access policy for a channel.
 +// A thread can be allowed by its own id; otherwise it falls back to its parent.
 +function findGroupPolicy(
@@ -544,7 +541,7 @@
 +// Bots the host has not seen are not in the member cache (no privileged intent, no full fetch). Ask Discord for each
 +// bot laris-team knows (oracles/*/config.yaml client_id), one member at a time: a single-member fetch needs no intent.
 +async function warmKnownBots(guild: NonNullable<Message['guild']>, access: Access) {
-+  const team = larisTeamDir(access)
++  const team = oracleTeamDir(access)
 +  if (!team) return
 +  let names: string[] = []
 +  try { names = readdirSync(join(team, 'oracles')) } catch { return }
@@ -575,7 +572,7 @@
 +// "lawer-oracle" while its config is lawyer-oracle, so the scan could not give its --thread line)
 +function knownOracleIds(access: Access): Map<string, string> {
 +  const out = new Map<string, string>()
-+  const team = larisTeamDir(access)
++  const team = oracleTeamDir(access)
 +  if (!team) return out
 +  let names: string[] = []
 +  try { names = readdirSync(join(team, 'oracles')) } catch { return out }
@@ -584,10 +581,10 @@
 +      const m = /^client_id:\s*"?(\d{17,})"?/m.exec(readFileSync(join(team, 'oracles', n, 'config.yaml'), 'utf8'))
 +      if (m) out.set(m[1]!, n)
 +    } catch {}
-   }
++  }
 +  return out
- }
- 
++}
++
 +async function oracleThreads(room: any, guild: NonNullable<Message['guild']>, access: Access, myName: string) {
 +  const bots = [...guild.members.cache.values()].filter(m => m.user.bot)
 +  if (guild.members.me && !bots.includes(guild.members.me)) bots.push(guild.members.me)
@@ -629,20 +626,21 @@
 +  return out
 +}
 +
-+// The laris-team checkout: from an answerCmd that access-sync wrote (".../tools/discord-say.sh"), else LARIS_TEAM_DIR.
-+function larisTeamDir(access: Access): string | null {
++// The team checkout (holds oracles/<name>/config.yaml): access.teamDir, else an answerCmd's ".../tools/discord-say.sh",
++// else ORACLE_TEAM_DIR (LARIS_TEAM_DIR still read for old installs).
++function oracleTeamDir(access: Access): string | null {
 +  if (access.teamDir) return access.teamDir   // written by access-sync (2026-11-01)
 +  for (const pol of [...Object.values(access.groups ?? {}), ...Object.values(access.guilds ?? {})]) {
 +    const m = /(\/\S*?)\/tools\/discord-say\.sh/.exec(pol?.answerCmd ?? '')
 +    if (m) return m[1]!
 +  }
-+  return process.env.LARIS_TEAM_DIR || null
++  return process.env.ORACLE_TEAM_DIR || process.env.LARIS_TEAM_DIR || null
 +}
 +
 +// This bot's oracle name, from its state dir (~/.claude/channels/<oracle>), else the host's.
 +function myOracle(): string {
 +  const state = basename(STATE_DIR)
-+  return /-oracle$/.test(state) ? state : 'laris-labs-oracle'
++  return /-oracle$/.test(state) ? state : (process.env.ORACLE_HOST_NAME || 'host-oracle')
 +}
 +
 +async function guildSetup(msg: Message, access: Access): Promise<void> {
@@ -711,9 +709,9 @@
 +
 +  // 3. name check: "CMMC Avengers" -> cmmc-avengers-oracle
 +  const slug = setupSlug(guild.name) + '-oracle'
-+  const team = larisTeamDir(access)
++  const team = oracleTeamDir(access)
 +  const exists = team ? existsSync(join(team, 'oracles', slug, 'config.yaml')) : null
-+  const nameLine = exists === null ? `- oracles/${slug}: unknown (laris-team dir not found)`
++  const nameLine = exists === null ? `- oracles/${slug}: unknown (team dir not found)`
 +    : `- oracles/${slug}/config.yaml: ${exists ? 'ok' : 'missing'}`
 +
 +  // 4. rule scan. Bots come from the member cache, warmed with the bots laris-team knows (warmKnownBots).
@@ -746,8 +744,8 @@
 +        const cfg = team ? existsSync(join(team, 'oracles', t.slug, 'config.yaml')) : null
 +        const give = `\`just guild-setup ${t.slug} ${guild.id} --thread ${t.id}\``
 +        return [`- ${t.slug}: thread ${t.id} (${t.how})`,
-+          cfg === null ? `  - ${give} (laris-team dir not found, check oracles/${t.slug})`
-+            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in laris-team: make the bot first`]
++          cfg === null ? `  - ${give} (team dir not found, check oracles/${t.slug})`
++            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in the team dir: make the bot first`]
 +      }) : ['- no bot named "... Oracle" in the member cache']),
 +    '',
 +    `**My permissions**`,
@@ -793,7 +791,7 @@
  async function gate(msg: Message): Promise<GateResult> {
    const access = loadAccess()
    const pruned = pruneExpired(access)
-@@ -274,22 +983,49 @@
+@@ -274,22 +984,49 @@
    }
  
    // We key on channel ID (not guild ID) — simpler, and lets the user
@@ -851,7 +849,7 @@
    return { action: 'deliver', access }
  }
  
-@@ -409,8 +1145,8 @@
+@@ -409,8 +1146,8 @@
      const userId = ch.recipientId ?? dmChannelUsers.get(id)
      if (userId && access.allowFrom.includes(userId)) return ch
    } else {
@@ -862,13 +860,10 @@
    }
    throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
  }
-@@ -565,6 +1301,18 @@
-           text: { type: 'string' },
-         },
-         required: ['chat_id', 'message_id', 'text'],
-+      },
-+    },
-+    {
+@@ -568,6 +1305,18 @@
+       },
+     },
+     {
 +      name: 'rename_thread',
 +      description: 'Rename a Discord thread (laris-co patch). Use it to give a thread opened by a bare "!thread" a short, meaningful name taken from the conversation (max 90 chars).',
 +      inputSchema: {
@@ -878,10 +873,13 @@
 +          name: { type: 'string' },
 +        },
 +        required: ['chat_id', 'name'],
-       },
-     },
-     {
-@@ -605,12 +1353,23 @@
++      },
++    },
++    {
+       name: 'download_attachment',
+       description: 'Download attachments from a specific Discord message to the local inbox. Use after fetch_messages shows a message has attachments (marked with +Natt). Returns file paths ready to Read.',
+       inputSchema: {
+@@ -605,12 +1354,23 @@
        case 'reply': {
          const chat_id = args.chat_id as string
          const text = args.text as string
@@ -907,7 +905,7 @@
          for (const f of files) {
            assertSendable(f)
            const st = statSync(f)
-@@ -689,6 +1448,14 @@
+@@ -689,6 +1449,14 @@
          const edited = await msg.edit(args.text as string)
          return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
        }
@@ -922,7 +920,7 @@
        case 'download_attachment': {
          const ch = await fetchAllowedChannel(args.chat_id as string)
          const msg = await ch.messages.fetch(args.message_id as string)
-@@ -745,6 +1512,45 @@
+@@ -745,6 +1513,45 @@
  // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
  // Security mirrors the text-reply path: allowFrom must contain the sender.
  client.on('interactionCreate', async (interaction: Interaction) => {
@@ -968,7 +966,7 @@
    if (!interaction.isButton()) return
    const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
    if (!m) return
-@@ -802,12 +1608,34 @@
+@@ -802,12 +1609,34 @@
      .catch(() => {})
  })
  
@@ -1004,7 +1002,7 @@
    const result = await gate(msg)
  
    if (result.action === 'drop') return
-@@ -824,8 +1652,143 @@
+@@ -824,8 +1653,143 @@
      return
    }
  
@@ -1013,7 +1011,7 @@
 +  // laris-co patch: read these before "!here" or a new thread changes the picture.
 +  const roomPolicy = msg.channel.type !== ChannelType.DM ? findGroupPolicy(result.access, msg.channel) : undefined
 +  const tagged = !!roomPolicy && await isMentioned(msg, result.access.mentionPatterns)
-+
+ 
 +  // laris-co patch (Nat 2026-11-02): a read-only copy to the mirrors first, whoever answers below.
 +  if (roomPolicy?.mirrorTo?.length) mirrorMessage(msg, roomPolicy, msg.channelId)
 +
@@ -1061,7 +1059,7 @@
 +    void th?.send?.({ content: `👋 here (summoned by <@${msg.author.id}>)`, allowedMentions: { parse: [] } }).catch(() => {})
 +    return
 +  }
- 
++
 +  // laris-co patch: "!!<name>" (or "!!thread <name>") = a standalone public thread in this channel (in the parent when typed
 +  // inside a thread), opened by the HOST only, with every trusted human added as a member. Other bots ignore it.
 +  if (msg.channel.type !== ChannelType.DM) {
@@ -1149,7 +1147,7 @@
    if (msg.channel.type === ChannelType.DM) {
      dmChannelUsers.set(chat_id, msg.author.id)
    }
-@@ -868,9 +1831,16 @@
+@@ -868,9 +1832,16 @@
      atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
    }
  
@@ -1166,7 +1164,7 @@
  
    mcp.notification({
      method: 'notifications/claude/channel',
-@@ -882,6 +1852,11 @@
+@@ -882,6 +1853,11 @@
          user: msg.author.username,
          user_id: msg.author.id,
          ts: msg.createdAt.toISOString(),
@@ -1178,7 +1176,7 @@
          ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
        },
      },
-@@ -890,6 +1865,25 @@
+@@ -890,6 +1866,25 @@
    })
  }
  

@@ -150,7 +150,7 @@ type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   /** laris-co patch: the host oracle of this guild (written by access-sync). Only the host acts on "!!thread". */
   host?: boolean
-  /** laris-co patch: the laris-team checkout (written by access-sync), for the !!setup name check. */
+  /** laris-co patch: the team checkout with oracles/<name>/config.yaml (written by access-sync), for the !!setup name check. */
   teamDir?: string
   allowFrom: string[]
   /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
@@ -696,7 +696,7 @@ const SETUP_RE = /^!!setup$/i
 // Bots the host has not seen are not in the member cache (no privileged intent, no full fetch). Ask Discord for each
 // bot laris-team knows (oracles/*/config.yaml client_id), one member at a time: a single-member fetch needs no intent.
 async function warmKnownBots(guild: NonNullable<Message['guild']>, access: Access) {
-  const team = larisTeamDir(access)
+  const team = oracleTeamDir(access)
   if (!team) return
   let names: string[] = []
   try { names = readdirSync(join(team, 'oracles')) } catch { return }
@@ -727,7 +727,7 @@ const setupSlug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').rep
 // "lawer-oracle" while its config is lawyer-oracle, so the scan could not give its --thread line)
 function knownOracleIds(access: Access): Map<string, string> {
   const out = new Map<string, string>()
-  const team = larisTeamDir(access)
+  const team = oracleTeamDir(access)
   if (!team) return out
   let names: string[] = []
   try { names = readdirSync(join(team, 'oracles')) } catch { return out }
@@ -781,20 +781,21 @@ async function oracleThreads(room: any, guild: NonNullable<Message['guild']>, ac
   return out
 }
 
-// The laris-team checkout: from an answerCmd that access-sync wrote (".../tools/discord-say.sh"), else LARIS_TEAM_DIR.
-function larisTeamDir(access: Access): string | null {
+// The team checkout (holds oracles/<name>/config.yaml): access.teamDir, else an answerCmd's ".../tools/discord-say.sh",
+// else ORACLE_TEAM_DIR (LARIS_TEAM_DIR still read for old installs).
+function oracleTeamDir(access: Access): string | null {
   if (access.teamDir) return access.teamDir   // written by access-sync (2026-11-01)
   for (const pol of [...Object.values(access.groups ?? {}), ...Object.values(access.guilds ?? {})]) {
     const m = /(\/\S*?)\/tools\/discord-say\.sh/.exec(pol?.answerCmd ?? '')
     if (m) return m[1]!
   }
-  return process.env.LARIS_TEAM_DIR || null
+  return process.env.ORACLE_TEAM_DIR || process.env.LARIS_TEAM_DIR || null
 }
 
 // This bot's oracle name, from its state dir (~/.claude/channels/<oracle>), else the host's.
 function myOracle(): string {
   const state = basename(STATE_DIR)
-  return /-oracle$/.test(state) ? state : 'laris-labs-oracle'
+  return /-oracle$/.test(state) ? state : (process.env.ORACLE_HOST_NAME || 'host-oracle')
 }
 
 async function guildSetup(msg: Message, access: Access): Promise<void> {
@@ -863,9 +864,9 @@ async function guildSetup(msg: Message, access: Access): Promise<void> {
 
   // 3. name check: "CMMC Avengers" -> cmmc-avengers-oracle
   const slug = setupSlug(guild.name) + '-oracle'
-  const team = larisTeamDir(access)
+  const team = oracleTeamDir(access)
   const exists = team ? existsSync(join(team, 'oracles', slug, 'config.yaml')) : null
-  const nameLine = exists === null ? `- oracles/${slug}: unknown (laris-team dir not found)`
+  const nameLine = exists === null ? `- oracles/${slug}: unknown (team dir not found)`
     : `- oracles/${slug}/config.yaml: ${exists ? 'ok' : 'missing'}`
 
   // 4. rule scan. Bots come from the member cache, warmed with the bots laris-team knows (warmKnownBots).
@@ -898,8 +899,8 @@ async function guildSetup(msg: Message, access: Access): Promise<void> {
         const cfg = team ? existsSync(join(team, 'oracles', t.slug, 'config.yaml')) : null
         const give = `\`just guild-setup ${t.slug} ${guild.id} --thread ${t.id}\``
         return [`- ${t.slug}: thread ${t.id} (${t.how})`,
-          cfg === null ? `  - ${give} (laris-team dir not found, check oracles/${t.slug})`
-            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in laris-team: make the bot first`]
+          cfg === null ? `  - ${give} (team dir not found, check oracles/${t.slug})`
+            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in the team dir: make the bot first`]
       }) : ['- no bot named "... Oracle" in the member cache']),
     '',
     `**My permissions**`,
