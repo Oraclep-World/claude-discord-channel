@@ -24,6 +24,20 @@ guild-wide defaults, multi-bot rooms and handing a room to another agent.
 Everything is opt-in in `access.json`; with none of it set the plugin behaves like upstream.
 Full list: [docs/PATCHES.md](docs/PATCHES.md). Diff against upstream: [docs/upstream.patch](docs/upstream.patch).
 
+## Who hears what (listening on and off)
+
+| how | on | off | survives a restart |
+|---|---|---|---|
+| `!here` | `!here`, `!here 30m`, `!here 2h` in a room: answers without a tag | `!lock`, or idle for the set time (default 10 min) | no |
+| join a thread | tag the bot in a thread, or `!!summon @Bot` | `!leave` / `!kick` | yes (`joined.json`) |
+| per room | `requireMention: false` in `access.json` | `requireMention: true` | yes |
+| per machine | `access.local.json` beside `access.json`: `deny: true` silences a room on this machine only | delete the entry | yes, never committed or synced |
+
+The plugin re-reads both files on every message, so no restart is needed.
+
+**One bot, one listener.** Two processes holding the same bot both hear every message and both answer: two workers
+on one task. To keep a second agent informed, use `mirrorTo` (a read-only copy); to hand a room over, use `forwardTo`.
+
 ## Install
 
 ```bash
