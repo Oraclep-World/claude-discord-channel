@@ -18,6 +18,7 @@ guild-wide defaults, multi-bot rooms and handing a room to another agent.
 | `guilds: { "<id>": policy }` | one default policy for every room in a server |
 | role call (`roleCall`) | tagging a Discord role reaches every bot that holds it |
 | `forwardTo` | a room's messages go to another Claude Code session (a herdr pane, matched by folder) |
+| `mirrorTo` | a read-only copy of each message also goes to other sessions, even on another machine; the room's owner still answers |
 | `!!setup` | the host lays out a new server: rooms, a thread per bot, a rule check |
 
 Everything is opt-in in `access.json`; with none of it set the plugin behaves like upstream.
