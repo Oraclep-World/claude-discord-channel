@@ -1,0 +1,7 @@
+This repository contains the Discord channel plugin for Claude Code from
+Anthropic's claude-plugins-official marketplace (discord 0.0.4), licensed
+under the Apache License 2.0 (see LICENSE).
+
+Modified by Soul Brews Studio / Laris Co (2026): server.ts carries the
+"laris-co patch" changes listed in PATCHES.md and laris-co.patch. The first
+commit of this repository is the unmodified upstream source.
