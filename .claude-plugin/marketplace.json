@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "soul-brews",
+  "description": "Soul Brews Studio Claude Code plugins",
+  "owner": {
+    "name": "Soul Brews Studio"
+  },
+  "plugins": [
+    {
+      "name": "discord",
+      "description": "Discord channel with threads, !!<name>, summon and room forwarding (fork of the official 0.0.4)",
+      "category": "productivity",
+      "source": "./plugins/discord"
+    }
+  ]
+}

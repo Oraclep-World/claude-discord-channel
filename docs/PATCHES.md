@@ -5,7 +5,7 @@ The official `discord@claude-plugins-official` plugin listens only in channels l
 answers in a thread on that message**. This folder keeps the code we run, so any machine can install it
 and anyone can compare it with upstream.
 
-See README.md for install. `laris-co.patch` is `diff -u` of upstream 0.0.4 `server.ts` against ours.
+See README.md for install. `upstream.patch` is `diff -u` of upstream 0.0.4 `server.ts` against ours.
 
 ## What the patch adds (all opt-in in access.json)
 

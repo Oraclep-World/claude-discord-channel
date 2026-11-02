@@ -21,21 +21,32 @@ guild-wide defaults, multi-bot rooms and handing a room to another agent.
 | `!!setup` | the host lays out a new server: rooms, a thread per bot, a rule check |
 
 Everything is opt-in in `access.json`; with none of it set the plugin behaves like upstream.
-Full list: [PATCHES.md](PATCHES.md). Diff against upstream: [laris-co.patch](laris-co.patch).
+Full list: [docs/PATCHES.md](docs/PATCHES.md). Diff against upstream: [docs/upstream.patch](docs/upstream.patch).
 
 ## Install
 
 ```bash
-# 1. install the official plugin once in Claude Code
-/plugin install discord@claude-plugins-official
-# 2. put this server.ts over the cached copy
-cp server.ts ~/.claude/plugins/cache/claude-plugins-official/discord/0.0.4/server.ts
-# 3. start the agent with its own bot
+# in Claude Code
+/plugin marketplace add Soul-Brews-Studio/claude-discord-channel
+/plugin install discord@soul-brews
+
+# start an agent with its own bot (token from your password store, never a file in a repo)
 DISCORD_BOT_TOKEN=... DISCORD_STATE_DIR=~/.claude/channels/<name> \
-  claude --channels=plugin:discord@claude-plugins-official
+  claude --channels=plugin:discord@soul-brews
 ```
 
-Bot token and access setup: [UPSTREAM-README.md](UPSTREAM-README.md) and [ACCESS.md](ACCESS.md).
+Bot token and access setup: [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) and
+[plugins/discord/ACCESS.md](plugins/discord/ACCESS.md).
+
+## Layout
+
+```
+.claude-plugin/marketplace.json   this repo is a plugin marketplace ("soul-brews")
+plugins/discord/                  the plugin: server.ts, skills, manifest
+docs/PATCHES.md                   every change, setting by setting
+docs/upstream.patch               diff -u against the official 0.0.4 server.ts
+docs/UPSTREAM-README.md           the official README, unchanged
+```
 
 ## Rules we learned the hard way
 

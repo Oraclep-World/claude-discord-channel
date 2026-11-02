@@ -1,0 +1,14 @@
+{
+  "name": "discord",
+  "description": "Discord channel for Claude Code (official 0.0.4) + threads, !!<name>, summon, role calls, room forwarding. Manage access via /discord:access.",
+  "version": "0.0.4-sbs.1",
+  "keywords": [
+    "discord",
+    "messaging",
+    "channel",
+    "mcp"
+  ],
+  "author": {
+    "name": "Anthropic (upstream), Soul Brews Studio (patches)"
+  }
+}

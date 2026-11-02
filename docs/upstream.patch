@@ -1,5 +1,5 @@
 --- upstream-0.0.4/server.ts
-+++ server.ts
++++ plugins/discord/server.ts
 @@ -22,20 +22,32 @@
    GatewayIntentBits,
    Partials,
