@@ -128,6 +128,8 @@ type GroupPolicy = {
   threadOnMention?: boolean
   /** laris-co patch: never listen here, even when the guild default would. */
   deny?: boolean
+  /** laris-co patch: set beside deny in access.local.json by "!ears off"; "!ears on" lifts only a deny that has it. */
+  earsOff?: boolean
   /** laris-co patch: hand this room's messages to a herdr agent: a worktree path (matched on cwd, in any
    *  running herdr session) or an exact "session:pane". */
   forwardTo?: string
@@ -391,6 +393,120 @@ function hereCommand(msg: Message, access: Access): { kind: 'unlock' | 'lock'; i
     return { kind: 'unlock', idleMs: m ? Number(m[1]) * (m[2]!.startsWith('h') ? 3_600_000 : 60_000) : idleMs }
   }
   return null
+}
+
+// laris-co patch (Nat 2026-11-02: "build !ears on off"): "!ears off" / "!ears on" from a trusted human (global
+// allowFrom) switches this bot's listening in that room (or thread) on THIS machine, at once, no restart. It writes the
+// per-machine override access.local.json: off sets groups[room] { deny: true, earsOff: true }; on removes deny and the
+// marker only where earsOff is set, so chat can lower listening below what the terminal gave, never raise it.
+// Tagged bots/roles: only those act. Untagged off: only a bot that would have delivered this very untagged message
+// (host review on #90: a requireMention bot never heard it). Untagged on: every bot whose ears entry is there.
+// In a thread, "on" also lifts an ears-off on the parent room, which closes the thread too (review #90, point 2). Handled before gate() (a deaf bot would never hear "!ears on"); it never reaches Claude.
+// The block between ears:begin and ears:end is plain fs + logic so tools/ears-test.ts can run it on a scratch dir.
+// ears:begin
+type EarsWord = 'on' | 'off'
+type EarsLocal = { groups?: Record<string, Record<string, unknown>>; [k: string]: unknown }
+
+function earsCommand(content: string): EarsWord | null {
+  const m = /^!ears\s+(on|off)$/i.exec(content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim())
+  return m ? (m[1]!.toLowerCase() as EarsWord) : null
+}
+
+function earsRead(file: string): EarsLocal {
+  try { return JSON.parse(readFileSync(file, 'utf8')) as EarsLocal } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw err // a broken file is never overwritten from chat
+  }
+}
+
+// true when this room's own entry in access.local.json was made deaf by "!ears off"
+function earsOffHere(file: string, room: string): boolean {
+  try { return earsRead(file).groups?.[room]?.earsOff === true } catch { return false }
+}
+
+// Would this bot deliver an UNTAGGED message from this trusted sender here? Mirrors gate(): a joined thread always;
+// otherwise a live (not denied) policy whose allowFrom admits the sender, and no tag needed (requireMention false,
+// a thread this bot opened, or a room unlocked with !here).
+function earsHearsUntagged(
+  policy: { requireMention?: boolean; allowFrom?: string[] } | undefined,
+  sender: string, joined: boolean, ownThread: boolean, unlocked: boolean,
+): boolean {
+  if (joined) return true
+  if (!policy) return false
+  if ((policy.allowFrom ?? []).length > 0 && !policy.allowFrom!.includes(sender)) return false
+  return policy.requireMention === false || ownThread || unlocked
+}
+
+// The entries a word changes: off = this room; on = this room and (in a thread) the parent room, each only where
+// "!ears off" left its marker.
+function earsRooms(word: EarsWord, file: string, room: string, parent?: string | null): string[] {
+  if (word === 'off') return [room]
+  return [room, parent].filter((r): r is string => !!r && earsOffHere(file, r))
+}
+
+// Should this bot act? tagged = the message tags any user or role; aboutMe = one of them is this bot (or a role it
+// holds); hearsUntagged = earsHearsUntagged(...) for this bot.
+function earsShouldAct(word: EarsWord, tagged: boolean, aboutMe: boolean, hearsUntagged: boolean,
+  file: string, room: string, parent?: string | null): boolean {
+  if (tagged) return aboutMe
+  return word === 'off' ? hearsUntagged : earsRooms('on', file, room, parent).length > 0
+}
+
+// Apply the word to access.local.json. Returns true when the file changed. Other keys in the file and in the room's
+// entry are kept. A deny without earsOff (set from the terminal) is never touched.
+function earsApply(file: string, room: string, word: EarsWord): boolean {
+  const local = earsRead(file)
+  const groups = { ...(local.groups ?? {}) }
+  const entry = { ...(groups[room] ?? {}) }
+  if (word === 'off') {
+    if (entry.deny === true) return false // already deaf here (by ears, or by the terminal: leave its marker alone)
+    entry.deny = true
+    entry.earsOff = true
+  } else {
+    if (entry.earsOff !== true) return false
+    delete entry.deny
+    delete entry.earsOff
+  }
+  if (Object.keys(entry).length) groups[room] = entry; else delete groups[room]
+  const next: EarsLocal = { ...local, groups }
+  if (!Object.keys(groups).length) delete next.groups
+  const dir = file.slice(0, file.lastIndexOf('/')) || '.'
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const tmp = `${file}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, file)
+  return true
+}
+// ears:end
+
+// Runs before gate(). Returns true when the message was an "!ears" command (handled or ignored); it never goes further.
+function earsHandle(msg: Message): boolean {
+  if (!msg.guild) return false
+  const word = earsCommand(msg.content)
+  if (!word) return false
+  const access = loadAccess()
+  if (!access.allowFrom.includes(msg.author.id) || !client.user) return true // not trusted: ignored silently
+  const me = client.user.id
+  const tagged = msg.mentions.users.size > 0 || msg.mentions.roles.size > 0
+  const mine = msg.guild.members.me?.roles.cache
+  const aboutMe = msg.mentions.users.has(me) || (!!mine && msg.mentions.roles.some(r => mine.has(r.id)))
+  const room = msg.channelId
+  const parent = msg.channel.isThread() ? msg.channel.parentId : null
+  const hearsUntagged = earsHearsUntagged(findGroupPolicy(access, msg.channel), msg.author.id,
+    readJoined().includes(room), isOwnThread(msg.channel), isUnlocked(room))
+  if (!earsShouldAct(word, tagged, aboutMe, hearsUntagged, ACCESS_LOCAL_FILE, room, parent)) return true
+  if (STATIC) { void msg.react('⚠️').catch(() => {}); return true } // static mode never re-reads access.local.json
+  try {
+    for (const r of earsRooms(word, ACCESS_LOCAL_FILE, room, parent)) earsApply(ACCESS_LOCAL_FILE, r, word)
+  } catch (err) {
+    process.stderr.write(`discord: !ears ${word} failed: ${err}\n`)
+    void msg.react('⚠️').catch(() => {})
+    return true
+  }
+  // "on" only lifts what "!ears off" set: if the room is still closed (terminal deny), say so with 🚫
+  const emoji = word === 'off' ? '🙉' : findGroupPolicy(loadAccess(), msg.channel) ? '👂' : '🚫'
+  void msg.react(emoji).catch(() => {})
+  return true
 }
 
 // laris-co patch: history backfill, the Hermes way. Read back from the tag until this bot's own
@@ -989,6 +1105,12 @@ async function gate(msg: Message): Promise<GateResult> {
   // laris-co patch: a roll call (@All Oracles) from a trusted human reaches every awake bot in any room.
   const kicked = kickGate(msg, access)
   if (kicked) return kicked
+  // laris-co patch (!ears): a room made deaf by "!ears off" (or the parent of a thread) drops everything here, before
+  // the roll call and the joined-thread pass, which would otherwise get past its deny.
+  const parentId = msg.channel.isThread() ? msg.channel.parentId : null
+  if (earsOffHere(ACCESS_LOCAL_FILE, msg.channelId) || (parentId && earsOffHere(ACCESS_LOCAL_FILE, parentId))) {
+    return { action: 'drop' }
+  }
   if (isRollCall(msg, access)) {
     rollCallRooms.add(msg.channelId)
     if (msg.channel.isThread()) { setJoined(msg.channelId, true); setKicked(msg.channelId, false) }
@@ -1636,6 +1758,9 @@ async function handleInbound(msg: Message): Promise<void> {
     }
     return
   }
+
+  // laris-co patch (Nat 2026-11-02): "!ears on|off" runs before the gate too, so a deaf bot still hears "!ears on".
+  if (earsHandle(msg)) return
 
   const result = await gate(msg)
 
