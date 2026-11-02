@@ -15,6 +15,7 @@ guild-wide defaults, multi-bot rooms and handing a room to another agent.
 | `!!summon @Bot [@Bot…]` | the tagged bots share one thread named after them |
 | `!thread <name>` / `!thread on|off` | a named thread on this message / switch the room between thread and inline answers |
 | `!here` / `!lock` | open a room to untagged messages for a while, then close it |
+| `!ears off` / `!ears on` | silence or restore a bot in one room on this machine, no restart (`access.local.json`) |
 | `guilds: { "<id>": policy }` | one default policy for every room in a server |
 | role call (`roleCall`) | tagging a Discord role reaches every bot that holds it |
 | `forwardTo` | a room's messages go to another Claude Code session (a herdr pane, matched by folder) |
@@ -31,7 +32,7 @@ Full list: [docs/PATCHES.md](docs/PATCHES.md). Diff against upstream: [docs/upst
 | `!here` | `!here`, `!here 30m`, `!here 2h` in a room: answers without a tag | `!lock`, or idle for the set time (default 10 min) | no |
 | join a thread | tag the bot in a thread, or `!!summon @Bot` | `!leave` / `!kick` | yes (`joined.json`) |
 | per room | `requireMention: false` in `access.json` | `requireMention: true` | yes |
-| per machine | `access.local.json` beside `access.json`: `deny: true` silences a room on this machine only | delete the entry | yes, never committed or synced |
+| per machine | `!ears off` (or `deny: true` by hand in `access.local.json`) silences a room on this machine only | `!ears on` (lifts only what `!ears off` set) | yes, never committed or synced |
 
 The plugin re-reads both files on every message, so no restart is needed.
 
@@ -40,15 +41,36 @@ on one task. To keep a second agent informed, use `mirrorTo` (a read-only copy);
 
 ## Install
 
+Same bot, same `access.json`: only the plugin source changes. Pick ONE of the two ways per machine.
+
+### A. Our plugin from this marketplace (tested 2026-11-02 on Linux, Claude Code 2.1.316)
+
 ```bash
-# in Claude Code
 /plugin marketplace add Soul-Brews-Studio/claude-discord-channel
 /plugin install discord@soul-brews
 
-# start an agent with its own bot (token from your password store, never a file in a repo)
 DISCORD_BOT_TOKEN=... DISCORD_STATE_DIR=~/.claude/channels/<name> \
-  claude --channels=plugin:discord@soul-brews
+  claude --dangerously-load-development-channels plugin:discord@soul-brews
 ```
+
+- `--channels=plugin:discord@soul-brews` alone loads the plugin but delivers nothing: Claude Code only accepts
+  channels from its approved allowlist and logs `plugin discord@soul-brews is not on the approved channels allowlist`.
+- `--dangerously-load-development-channels` shows a one-time warning at start
+  (`1. I am using this for local development`). Unattended restarts must answer it.
+- Never enable `discord@soul-brews` and `discord@claude-plugins-official` together: both are named `discord`,
+  so a body with a token would open two Discord connections and answer twice. Disable one
+  (`claude plugin disable discord@claude-plugins-official`).
+
+### B. The official plugin with our `server.ts` over it (what our fleet runs)
+
+```bash
+/plugin install discord@claude-plugins-official
+cp plugins/discord/server.ts ~/.claude/plugins/cache/claude-plugins-official/discord/0.0.4/server.ts
+DISCORD_BOT_TOKEN=... DISCORD_STATE_DIR=~/.claude/channels/<name> \
+  claude --channels=plugin:discord@claude-plugins-official
+```
+
+No warning prompt, but a plugin update overwrites the copy: copy it again after every update.
 
 Bot token and access setup: [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) and
 [plugins/discord/ACCESS.md](plugins/discord/ACCESS.md).

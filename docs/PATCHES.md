@@ -168,3 +168,22 @@ access:
   `maw hey` / herdr for that.
 - **Untyped access.** The patch reads `ownerId` and `guildId` off the channel at runtime. It builds with
   `bun build`, but nobody has type-checked it with `tsc`.
+- **`!ears off` / `!ears on`**: a trusted human (global `allowFrom`) switches a bot's
+  listening in one room or thread **on this machine**, at once, with no restart. `off` writes
+  `{ "deny": true, "earsOff": true }` for that room into `access.local.json` (atomic, mode 600, other keys kept), and the
+  bot reacts 🙉. `on` removes the deny only where `earsOff` marks it, and drops the entry when it is empty; the bot reacts
+  👂, or 🚫 when the room stays closed by the terminal. Chat can only lower listening below what the terminal gave, never
+  raise it: a `deny` written by hand survives `!ears on`. ⚠️ means the file could not be written
+  (a broken `access.local.json` is never overwritten).
+  - Who acts: tag bots or roles (`@SomeBot !ears off`, `@some-role !ears off`) and only those act. Untagged,
+    `off` reaches only the bots that would have received that very untagged message: a joined thread, or a live policy
+    that admits the sender and needs no tag (`requireMention: false`, a thread the bot opened, or a room unlocked with
+    `!here`). A bot that only answers tags (most bots in #general, through the guild default) ignores an untagged
+    `!ears off`; tag it instead. Untagged `on` reaches every bot whose ears entry is there.
+  - The room is the channel the message is in: in a thread, `off` silences only that thread. Off in a room also closes
+    its threads, joined ones and roll calls included: while a room or its parent has `earsOff`, the gate drops
+    everything there except `!ears on`. So `!ears on` typed inside such a thread lifts the parent room's ears entry
+    too (and the thread's own, if it has one): the room and its threads hear again.
+  - It is handled before the gate, so a deaf bot still hears `!ears on`, and it never reaches Claude. Untrusted senders
+    are ignored silently. Static mode (`DISCORD_ACCESS_MODE=static`) never reads `access.local.json`: the bot reacts ⚠️.
+  - `bun tests/ears-test.ts` checks the file logic on a scratch dir (it runs the `ears:begin`…`ears:end` block of `server.ts`).
