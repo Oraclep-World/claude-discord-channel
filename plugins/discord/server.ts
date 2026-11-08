@@ -38,7 +38,7 @@ import { randomBytes, createHash } from 'crypto'
 import { spawn, spawnSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync, openSync } from 'fs'
 import { homedir, hostname } from 'os'
-import { closeKind, closePicked, closeRoomList, closeRoomPicker, closeThread, idleMin, installRooms, interactionCallback, leanDetect, leanPlans, officeToggle, roomStatus, roomThreads, soulIcon, soulPicker } from './laris/rooms.ts'
+import { closeKind, closePicked, closeRoomList, closeRoomPicker, closeThread, idleMin, installRooms, interactionCallback, leanDetect, leanPlans, officeToggle, recentLines, recentRooms, roomStatus, roomThreads, soulIcon, soulPicker } from './laris/rooms.ts'
 import { idsText } from './laris/ids.ts'
 import { workMake, workPlans, workRepo, workStart, workView, workWake } from './laris/work.ts'
 import { archiveDry, archivePlans, archiveStart, archiveView } from './laris/archive.ts'
@@ -2348,6 +2348,34 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       donePlans.set(interaction.user.id, { kind, repo, name, thread: ch.id, room: ch.parentId })
       await interaction.reply({ ephemeral: true, content: `**Done with this thread?** (only you see this)\n${what}\nNothing is deleted.`,
         components: [{ type: 1, components: [{ type: 2, style: 3, custom_id: 'done:go', label: 'Done ✓' }, { type: 2, style: 2, custom_id: 'done:no', label: 'Cancel' }] }] } as any).catch(() => {})
+      return
+    }
+    // /git (Nat 2026-11-08 "can we have /git [no params] to list", "some params to search"): read-only git view of this
+    // room's repo (tools/git-slash.sh); find: = commits, branches and PRs that match. Only the caller sees it.
+    if (interaction.commandName === 'recent') {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const lines = interaction.guild ? await recentLines(access, interaction.guild, 15) : []
+      const evs = recentRooms(access, 10)
+      await interaction.editReply({ allowedMentions: { parse: [] }, content: [lines.length ? '**recent talk** · repo rooms + threads, newest first\n' + lines.join('\n') : '',
+        evs.length ? '**recent rooms** · opened, archived, unarchived\n' + evs.join('\n') : ''].filter(Boolean).join('\n\n').slice(0, 1990) || 'nothing yet' }).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'git') {
+      const chG: any = interaction.channel
+      // Nat 2026-11-08 "git should all orgs and all repos ... of mine": kind:all (or any room that is not a repo room) =
+      // every repo of Nat's user + orgs on GitHub
+      const allG = interaction.options.getString('kind') === 'all'
+      const repoG = allG ? '' : (roomRepo(access, chG, chG ? findGroupPolicy(access, chG) : undefined) ?? '')
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+      const q = String(interaction.options.getString('find') ?? '').trim().slice(0, 80)
+      const out = await new Promise<string>(res => {
+        let o = ''; const p = spawn('bash', [join(team, 'tools', 'git-slash.sh'), repoG || '--all', ...(q ? [q] : [])], { stdio: ['ignore', 'pipe', 'pipe'] })
+        const t = setTimeout(() => p.kill(), 30000)
+        p.stdout.on('data', d => { o += String(d) }); p.stderr.on('data', d => { o += String(d) })
+        p.on('close', () => { clearTimeout(t); res(o) }); p.on('error', e => { clearTimeout(t); res(String(e)) })
+      })
+      await interaction.editReply({ content: '```\n' + (out.trim() || 'no output').replace(/```/g, "'''").slice(0, 1900) + '\n```' }).catch(() => {})
       return
     }
     if (interaction.commandName === 'ls') {

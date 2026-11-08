@@ -40,16 +40,59 @@ export async function boardUpdate(): Promise<void> {
       (wts.length ? ` · ${wts.length} wt` : '') + (other > 0 ? ` · ${other} thread${other > 1 ? 's' : ''}` : ''))
   }
   const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' })
-  const body = [`📋 **board** · updated ${now} · \`/help\` for commands`, '', ...lines].join('\n').slice(0, 1990)
+  const recent = await recentLines(access, bch.guild, 6).catch(() => [] as string[])
+  const evs = recentRooms(access, 4)
+  const body = [`📋 **board** · updated ${now} · \`/help\` for commands`, '', ...lines, ...(recent.length ? ['', '**recent talk**', ...recent] : []),
+    ...(evs.length ? ['', '**recent rooms**', ...evs] : [])].join('\n').slice(0, 1990)
   const msg: any = await bch.messages.fetch(cfg.message).catch(() => null)
   if (msg) await msg.edit({ content: body, allowedMentions: { parse: [] } }).catch(() => {})
   await buildIds(bch.guild).catch(() => {})   // the id map is rebuilt at the same moment as the board
 }
+// laris-co patch (Nat 2026-11-08 "we should have /recent and please report in 📋 board too"): the repo rooms and their
+// threads by last message, newest first. Only discord.js's cache (lastMessageId is a snowflake = a time): no API call.
+export async function recentLines(access: Access, guild: any, n: number): Promise<string[]> {
+  const act: any = await guild.channels.fetchActiveThreads().catch(() => null)
+  const threads: any[] = act ? [...act.threads.values()] : []
+  const rooms = Object.entries(access.groups ?? {}).filter(([, g]: any) => g?.repo && !g.deny && !g.archived).map(([id]) => id)
+  const at = (mid?: string | null) => mid ? Number((BigInt(mid) >> 22n) + 1420070400000n) : 0
+  const items: { t: number; line: string }[] = []
+  for (const id of rooms) {
+    const room: any = guild.channels.cache.get(id)
+    if (!room) continue
+    const icon = String(room.name).split('・')[0]
+    if (at(room.lastMessageId)) items.push({ t: at(room.lastMessageId), line: `${icon} <#${id}>` })
+    for (const t of threads.filter(t => t.parentId === id)) if (at(t.lastMessageId)) items.push({ t: at(t.lastMessageId), line: `${icon} <#${t.id}>` })
+  }
+  const ago = (t: number) => { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'now' : m < 60 ? `${m}m` : m < 2880 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d` }
+  return items.sort((a, b) => b.t - a.t).slice(0, n).map(x => `\`${ago(x.t).padStart(4)}\` ${x.line}`)
+}
+// Nat 2026-11-08 "we should create /recent to list our works? or recently archived or unarchived": room events from the
+// Laris rows. 📦 opened (the channel id is a snowflake = its creation time), 🗄️ archived_at, ♻️ unarchived_at.
+export function recentRooms(access: Access, n: number): string[] {
+  const ev: { t: number; line: string }[] = []
+  for (const [id, g] of Object.entries(access.groups ?? {}) as any) {
+    if (!g?.repo || g.layout !== 9) continue
+    const name = `\`${g.repo}\``
+    if (/^\d{15,22}$/.test(id)) ev.push({ t: Number((BigInt(id) >> 22n) + 1420070400000n), line: `📦 opened ${name} <#${id}>` })
+    if (g.archived_at) ev.push({ t: Date.parse(g.archived_at), line: `🗄️ archived ${name}${g.archived ? '' : ' (back since)'}` })
+    if (g.unarchived_at) ev.push({ t: Date.parse(g.unarchived_at), line: `♻️ unarchived ${name} <#${id}>` })
+  }
+  const ago = (t: number) => { const m = Math.round((Date.now() - t) / 60000); return m < 60 ? `${m}m` : m < 2880 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d` }
+  return ev.filter(e => e.t).sort((a, b) => b.t - a.t).slice(0, n).map(e => `\`${ago(e.t).padStart(4)}\` ${e.line}`)
+}
+let recentTimer: any = null
+export function recentKick(): void { if (!recentTimer) recentTimer = setTimeout(() => { recentTimer = null; boardKick() }, 60000) }
+
 export function installRooms(): void {
   client.on('threadUpdate', () => boardKick())
   client.on('threadDelete', () => boardKick())
   client.once('ready', () => boardKick())
   client.on('threadCreate', onThreadCreate)
+  // a message in a repo room or its threads refreshes the board's recent list, at most once a minute
+  client.on('messageCreate', (m: any) => {
+    const g = (loadAccess().groups as any) ?? {}
+    if (g[m.channelId]?.repo || g[m.channel?.parentId]?.repo) recentKick()
+  })
 }
 
 // laris-co patch (Nat 2026-11-08: "if not wt it should like welcome Laris Labs Oracle and Somsri (gm) and can have
