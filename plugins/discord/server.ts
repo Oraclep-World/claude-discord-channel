@@ -34,13 +34,18 @@ import {
   type FetchedThreads,
   type ThreadChannel,
 } from 'discord.js'
-import { randomBytes } from 'crypto'
+import { randomBytes, createHash } from 'crypto'
 import { spawn, spawnSync } from 'child_process'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
-import { homedir } from 'os'
-import { join, sep, basename } from 'path'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync, openSync } from 'fs'
+import { homedir, hostname } from 'os'
+import { closeKind, closePicked, closeRoomList, closeRoomPicker, closeThread, idleMin, installRooms, interactionCallback, leanDetect, leanPlans, officeToggle, roomStatus, roomThreads, soulIcon, soulPicker } from './laris/rooms.ts'
+import { idsText } from './laris/ids.ts'
+import { workMake, workPlans, workRepo, workStart, workView } from './laris/work.ts'
+import { archiveDry, archivePlans, archiveStart, archiveView } from './laris/archive.ts'
+import { PROMOTE_GO, promoteMake, promotePlans, promoteStart, promoteTarget, promoteView } from './laris/promote.ts'
+import { join, sep, basename, dirname } from 'path'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+export const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 // laris-co patch: per-room answer mode set from chat with "!thread on|off". Survives restarts.
 const MODES_FILE = join(STATE_DIR, 'modes.json')
@@ -102,7 +107,7 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const client = new Client({
+export const client = new Client({
   intents: [
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.Guilds,
@@ -148,11 +153,11 @@ type GroupPolicy = {
   mirrorTo?: string[]
 }
 
-type Access = {
+export type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   /** laris-co patch: the host oracle of this guild (written by access-sync). Only the host acts on "!!thread". */
   host?: boolean
-  /** laris-co patch: the team checkout with oracles/<name>/config.yaml (written by access-sync), for the !!setup name check. */
+  /** laris-co patch: the laris-team checkout (written by access-sync), for the !!setup name check. */
   teamDir?: string
   allowFrom: string[]
   /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
@@ -284,7 +289,7 @@ function applyLocalOverride(a: Access): Access {
   return a
 }
 
-function loadAccess(): Access {
+export function loadAccess(): Access {
   return BOOT_ACCESS ?? applyLocalOverride(readAccessFile())
 }
 
@@ -338,7 +343,7 @@ function noteSent(id: string): void {
 
 // Find the access policy for a channel.
 // A thread can be allowed by its own id; otherwise it falls back to its parent.
-function findGroupPolicy(
+export function findGroupPolicy(
   access: Access,
   channel: { id: string; isThread(): boolean; parentId?: string | null; guildId?: string | null },
 ): GroupPolicy | undefined {
@@ -363,6 +368,17 @@ function findGroupPolicy(
 // laris-co patch: a thread this bot opened answers without a fresh tag.
 function isOwnThread(channel: { isThread(): boolean; ownerId?: string | null }): boolean {
   return channel.isThread() && !!client.user && channel.ownerId === client.user.id
+}
+// laris-co patch (2026-11-07, layout 9 pilot): "own thread" is decided per BOT, but one bot can run several bodies
+// (a main body on white + soul bodies in repos). A thread opened by the Pulse bot for its soul was heard untagged by
+// Pulse's MAIN body too, through its guild-wide default row. Own-thread hearing now needs a row for this thread or
+// its parent channel; a body that only matches the guild default row hears that thread like any other room.
+function ownThreadHere(access: Access, channel: { id: string; isThread(): boolean; parentId?: string | null; ownerId?: string | null }): boolean {
+  if (!isOwnThread(channel)) return false
+  const own = access.groups[channel.id]
+  if (own) return !own.deny
+  const parent = channel.parentId ? access.groups[channel.parentId] : undefined
+  return !!parent && !parent.deny
 }
 
 // laris-co patch: "!here" unlocks a room like a phone screen. While unlocked the bot answers inline
@@ -485,7 +501,7 @@ function earsHandle(msg: Message): boolean {
   const word = earsCommand(msg.content)
   if (!word) return false
   const access = loadAccess()
-  if (!access.allowFrom.includes(msg.author.id) || !client.user) return true // not trusted: ignored silently
+  if (!trustedForCommands(msg, access) || !client.user) return true // not trusted: ignored silently
   const me = client.user.id
   const tagged = msg.mentions.users.size > 0 || msg.mentions.roles.size > 0
   const mine = msg.guild.members.me?.roles.cache
@@ -493,7 +509,7 @@ function earsHandle(msg: Message): boolean {
   const room = msg.channelId
   const parent = msg.channel.isThread() ? msg.channel.parentId : null
   const hearsUntagged = earsHearsUntagged(findGroupPolicy(access, msg.channel), msg.author.id,
-    readJoined().includes(room), isOwnThread(msg.channel), isUnlocked(room))
+    readJoined().includes(room), ownThreadHere(access, msg.channel), isUnlocked(room))
   if (!earsShouldAct(word, tagged, aboutMe, hearsUntagged, ACCESS_LOCAL_FILE, room, parent)) return true
   if (STATIC) { void msg.react('⚠️').catch(() => {}); return true } // static mode never re-reads access.local.json
   try {
@@ -509,6 +525,356 @@ function earsHandle(msg: Message): boolean {
   return true
 }
 
+// laris-co patch (Nat 2026-11-02: "can we have /status in discord to check status?", laris-team #91): "!status" from a
+// trusted human (global allowFrom) makes each bot it applies to post ONE short reply with its live state: name, machine,
+// pid, uptime, which plugin copy it runs (marketplace dir + version, from this file's path), how it hears this room, and
+// the room's routing. Who answers follows "!ears": tagged bots/roles only; untagged = only bots that would deliver that
+// very untagged message (so #general does not get 30 replies). Handled before gate(), so a bot with ears off or a room
+// denied by the terminal still answers a tag. The reply goes out on the bot's own client, never through Claude and
+// never through the reply tool (which refuses denied rooms). No secrets: never the token, never access.json itself.
+// The block between status:begin and status:end is plain logic so tools/status-test.ts can run it.
+// status:begin
+function statusCommand(content: string): boolean {
+  return /^!status$/i.test(content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim())
+}
+
+// "!version" (Nat 2026-11-02: "can we have !version?"): one line per bot, the same who-answers rule as "!status".
+function versionCommand(content: string): boolean {
+  return /^!version$/i.test(content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim())
+}
+
+// running = the server.ts this process loaded (hashed at start); disk = the file there now. They differ after
+// `just plugin-patch` until the body restarts, which is exactly what "!version" is for.
+function versionText(name: string, plugin: { marketplace: string; version: string }, running: string, disk: string,
+  startedAt: Date, calver = '', diskCalver = ''): string {
+  const since = startedAt.toTimeString().slice(0, 5)
+  const tag = (c: string, sha: string) => (c ? `${c} (\`${sha}\`)` : `\`${sha}\``)
+  const state = disk === running ? 'up to date with this machine' : `on disk ${tag(diskCalver, disk)}: restart to load it`
+  return `**${name}** · ${tag(calver, running)} · ${plugin.marketplace} ${plugin.version} · since ${since} · ${state}`
+}
+
+// Where this server.ts runs from: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/server.ts, or a
+// marketplace checkout ~/.claude/plugins/marketplaces/<marketplace>/.../server.ts.
+function statusPlugin(path: string): { marketplace: string; version: string } {
+  const p = path.split(/[\\/]+/)
+  const c = p.lastIndexOf('cache')
+  if (c >= 0 && p.length > c + 3) return { marketplace: p[c + 1]!, version: `${p[c + 2]} ${p[c + 3]}` }
+  const m = p.lastIndexOf('marketplaces')
+  if (m >= 0 && p.length > m + 1) return { marketplace: p[m + 1]!, version: 'checkout' }
+  return { marketplace: 'local', version: p.slice(-2, -1)[0] ?? '?' }
+}
+
+function statusUptime(sec: number): string {
+  const s = Math.max(0, Math.floor(sec))
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60)
+  if (d) return `${d}d ${h}h`
+  if (h) return `${h}h ${m}m`
+  return m ? `${m}m` : `${s}s`
+}
+
+type StatusRoom = {
+  earsOff: boolean            // this room or its parent has an "!ears off" entry
+  denied: boolean             // a deny (not from !ears) closes it: own id, parent or guild default
+  policy?: { requireMention?: boolean; allowFrom?: string[] } // the live policy, if any
+  joined: boolean             // a thread this bot joined
+  ownThread: boolean          // a thread this bot opened
+  unlockedMin: number | null  // minutes left on "!here", null when locked
+}
+
+// How this bot hears the room, in a few words.
+function statusRoomLine(r: StatusRoom): string {
+  if (r.earsOff) return 'ears off (`!ears off`)'
+  if (r.joined) return 'joined thread: hears untagged'
+  if (r.denied) return 'denied by terminal'
+  if (!r.policy) return 'not listening (no policy)'
+  const only = (r.policy.allowFrom ?? []).length ? `, room allowFrom ${r.policy.allowFrom!.length}` : ''
+  if (r.unlockedMin !== null) return `\`!here\` unlocked, ${r.unlockedMin} min left${only}`
+  if (r.ownThread) return `own thread: hears untagged${only}`
+  return (r.policy.requireMention === false ? 'hears untagged' : 'tag only') + only
+}
+
+// Should this bot answer? Tagged: only the bots (or a role they hold) that were tagged, whatever their ears.
+// Untagged: only a bot that would deliver an untagged message here (earsHearsUntagged) and is not ears-off.
+function statusShouldAct(tagged: boolean, aboutMe: boolean, hearsUntagged: boolean, earsOff: boolean): boolean {
+  return tagged ? aboutMe : hearsUntagged && !earsOff
+}
+
+type StatusInfo = {
+  name: string; oracle: string; host: string; pid: number; uptimeSec: number
+  plugin: { marketplace: string; version: string }; patch: string
+  room: StatusRoom
+  routing: { forwardTo?: string; mirrorTo?: string[]; host: boolean }
+}
+
+function statusText(i: StatusInfo): string {
+  const fwd = i.routing.forwardTo ? `\`${i.routing.forwardTo}\`` : 'none'
+  const mir = i.routing.mirrorTo?.length ? i.routing.mirrorTo.map(t => `\`${t}\``).join(', ') : 'none'
+  return [
+    `**${i.name}** (${i.oracle})`,
+    `- machine: ${i.host} · pid ${i.pid} · up ${statusUptime(i.uptimeSec)}`,
+    `- plugin: ${i.plugin.marketplace} · ${i.plugin.version} · patch ${i.patch}`,
+    `- this room: ${statusRoomLine(i.room)}`,
+    `- forwardTo: ${fwd}`,
+    `- mirrorTo: ${mir}`,
+    `- host: ${i.routing.host ? 'yes' : 'no'}`,
+  ].join('\n')
+}
+// status:end
+
+// first 8 hex of this server.ts's sha256, to compare with plugin/discord/server.ts in laris-team
+let statusPatchSha: string | null = null
+function statusPatch(): string {
+  if (statusPatchSha) return statusPatchSha
+  try { statusPatchSha = createHash('sha256').update(readFileSync(import.meta.path)).digest('hex').slice(0, 8) } catch { statusPatchSha = '?' }
+  return statusPatchSha
+}
+statusPatch() // hash the file as loaded now, so "running" stays true after a later `just plugin-patch`
+const PROCESS_STARTED = new Date()
+// laris-team CalVer, written beside server.ts by `just plugin-patch` (LARIS_VERSION: "v26.11.2-2318 a108622")
+function calverNow(): string {
+  try { return readFileSync(join(dirname(import.meta.path), 'LARIS_VERSION'), 'utf8').trim().split(/\s+/)[0] ?? '' } catch { return '' }
+}
+const RUNNING_CALVER = calverNow()
+function diskPatch(): string {
+  try { return createHash('sha256').update(readFileSync(import.meta.path)).digest('hex').slice(0, 8) } catch { return '?' }
+}
+
+// laris-co patch (Nat 2026-11-03: "oh can we support !sleep !", then "if !wake should tell Laris Labs Oracle"):
+// "!sleep @bot" / "!sleep @role" from a trusted human puts each tagged bot to sleep the herdr-sleep way: it waits until
+// this agent is idle, asks it for its 4-line bookmark, writes a wake card, /exits Claude and KEEPS the herdr space, so
+// the sidebar layout stays. The host never sleeps this way (it is the one that wakes the others).
+// "!wake ..." cannot reach a sleeping bot (no process is listening), so it belongs to the host: every other bot drops
+// it here, and the host lets it through to its Claude, which wakes the cards with skills/team-wake/sleeper.py.
+// sleep:begin
+function sleepCommand(content: string): 'sleep' | 'wake' | null {
+  const t = content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase()
+  return /^!sleep$/.test(t) ? 'sleep' : /^!wake$/.test(t) ? 'wake' : null
+}
+// sleep:end
+
+// Runs before gate(). Returns true when the message was "!sleep" / "!wake" and this bot is done with it.
+function sleepHandle(msg: Message): boolean {
+  if (!msg.guild) return false
+  const word = sleepCommand(msg.content)
+  if (!word) return false
+  const access = loadAccess()
+  if (!trustedForCommands(msg, access) || !client.user) return true // not trusted: ignored silently
+  if (word === 'wake') return !access.host                                    // host: on to its Claude
+  if (access.host) return true                                                 // the host never sleeps by command
+  const me = client.user.id
+  const mine = msg.guild.members.me?.roles.cache
+  const aboutMe = msg.mentions.users.has(me) || (!!mine && msg.mentions.roles.some(r => mine.has(r.id)))
+  if (!aboutMe) return true
+  const pane = process.env.HERDR_PANE_ID, session = process.env.HERDR_SESSION
+  const tool = join(homedir(), '.local', 'bin', 'herdr-sleep')
+  if (!pane || !session || !existsSync(tool)) { void msg.react('⚠️').catch(() => {}); return true }
+  void msg.react('💤').catch(() => {})
+  // Detached: herdr-sleep ends this very Claude (and this plugin with it). It waits for idle first, because the agent
+  // may be mid-turn; the wait gives up after 10 minutes and the card is not written.
+  const label = myOracle()
+  const herdrBin = process.env.HERDR_BIN_PATH || 'herdr'
+  const script = `"${herdrBin}" --session '${session}' agent wait '${pane}' --until idle --until done --timeout 600000 >/dev/null 2>&1; ` +
+    `exec '${tool}' sleep '${pane}=${label}' --session '${session}' --keep-space`
+  try {
+    const log = join(STATE_DIR, 'sleep.log')
+    const out = openSync(log, 'a')
+    spawn('bash', ['-c', script], { detached: true, stdio: ['ignore', out, out] }).unref()
+  } catch (e) {
+    process.stderr.write(`discord: !sleep failed: ${e}\n`)
+    void msg.react('⚠️').catch(() => {})
+  }
+  return true
+}
+
+// Runs before gate(). Returns true when the message was "!status" (answered or ignored); it never goes further.
+function statusHandle(msg: Message): boolean {
+  if (!msg.guild) return false
+  const isVersion = versionCommand(msg.content)
+  if (!isVersion && !statusCommand(msg.content)) return false
+  const access = loadAccess()
+  if (!trustedForCommands(msg, access) || !client.user) return true // not trusted: ignored silently
+  const me = client.user.id
+  const tagged = msg.mentions.users.size > 0 || msg.mentions.roles.size > 0
+  const mine = msg.guild.members.me?.roles.cache
+  const aboutMe = msg.mentions.users.has(me) || (!!mine && msg.mentions.roles.some(r => mine.has(r.id)))
+  const room = msg.channelId
+  const parent = msg.channel.isThread() ? msg.channel.parentId : null
+  const policy = findGroupPolicy(access, msg.channel)
+  const joined = readJoined().includes(room)
+  const ownThread = ownThreadHere(access, msg.channel)
+  const earsOff = earsOffHere(ACCESS_LOCAL_FILE, room) || (!!parent && earsOffHere(ACCESS_LOCAL_FILE, parent))
+  const hearsUntagged = earsHearsUntagged(policy, msg.author.id, joined, ownThread, isUnlocked(room))
+  if (!statusShouldAct(tagged, aboutMe, hearsUntagged, earsOff)) return true
+  // Nat 2026-11-02 ("when !status it should call typing?"): show "typing" as soon as this bot decides to answer, as
+  // forwardTo does. The reply waits for the typing call, so a late typing event never outlives the reply.
+  const typing = 'sendTyping' in msg.channel ? msg.channel.sendTyping().catch(() => {}) : Promise.resolve()
+  // denied = the policy lookup hit a deny (own id, parent, guild default), as findGroupPolicy walks them
+  const raw = access.groups[room] ?? (parent ? access.groups[parent] : undefined) ?? access.guilds?.[msg.guild.id]
+  const u = unlocked.get(room)
+  const unlockedMin = isUnlocked(room) && u ? Math.max(1, Math.ceil((u.until - Date.now()) / 60_000)) : null
+  const text = isVersion ? versionText(client.user.username, statusPlugin(import.meta.path), statusPatch(), diskPatch(),
+    PROCESS_STARTED, RUNNING_CALVER, calverNow()) : statusText({
+    name: client.user.username, oracle: myOracle(), host: hostname(), pid: process.pid, uptimeSec: process.uptime(),
+    plugin: statusPlugin(import.meta.path), patch: RUNNING_CALVER ? `${RUNNING_CALVER} (${statusPatch()})` : statusPatch(),
+    room: { earsOff, denied: !policy && !!raw?.deny, policy, joined, ownThread, unlockedMin },
+    routing: { forwardTo: policy?.forwardTo, mirrorTo: policy?.mirrorTo, host: !!access.host },
+  })
+  void typing.then(() => msg.reply({ content: text, allowedMentions: { parse: [], repliedUser: false } }))
+    .catch(e => process.stderr.write(`discord: !status reply failed: ${e}\n`))
+  return true
+}
+
+// laris-co patch (laris-team #95, Nat 2026-11-02: "we should have an api to call?"): a heartbeat file. Every 30 s, on
+// gateway ready, on each inbound message, on "!ears" and on shutdown, this body writes <state dir>/status.json (tmp +
+// rename, mode 600): who it is, where it runs, which plugin copy, whether the gateway is up, when it last heard and
+// answered, which rooms "!ears off" silenced. `just bots` (tools/bots.py) reads these files on every machine. Only a
+// body with the bot token gets here (the token-less branch above never returns), so a deaf body writes nothing and
+// shows up as "no heartbeat". No secrets: never the token, never access.json.
+// The block between heartbeat:begin and heartbeat:end is plain logic so tools/heartbeat-test.ts can run it.
+// heartbeat:begin
+const HEARTBEAT_SCHEMA = 1
+const HEARTBEAT_EVERY_MS = 30_000
+
+type HeartbeatInput = {
+  oracle: string; stateDir: string
+  bot: { id: string; username: string } | null
+  host: string; pid: number; claudePid: number | null; cwd: string | null
+  herdr: { session: string | null; pane: string | null }
+  startedAt: number; now: number
+  plugin: { marketplace: string; version: string; sha8: string }
+  gateway: { ready: boolean; guilds: number }
+  lastGatewayAt: number | null; lastInboundAt: number | null; lastReplyAt: number | null
+  local: { groups?: Record<string, Record<string, unknown>> } // access.local.json, for the "!ears off" rooms
+  unlocked: Map<string, { until: number }>
+  joined: number; staticMode: boolean; stoppedAt: number | null
+  rivalPid: number | null // another live process wrote this same status.json: one bot, two bodies on this machine
+}
+
+const heartbeatIso = (t: number | null): string | null => (t === null ? null : new Date(t).toISOString())
+
+// The rooms "!ears off" silenced: entries in access.local.json carrying its earsOff marker.
+function heartbeatEarsOff(local: HeartbeatInput['local']): string[] {
+  return Object.entries(local.groups ?? {}).filter(([, g]) => g?.earsOff === true).map(([room]) => room).sort()
+}
+
+function heartbeatBuild(i: HeartbeatInput): Record<string, unknown> {
+  return {
+    schema: HEARTBEAT_SCHEMA,
+    oracle: i.oracle,
+    state_dir: i.stateDir,
+    bot: i.bot,
+    host: i.host,
+    pid: i.pid,
+    claude_pid: i.claudePid,
+    cwd: i.cwd,
+    herdr: i.herdr,
+    started_at: heartbeatIso(i.startedAt),
+    updated_at: heartbeatIso(i.now),
+    stopped_at: heartbeatIso(i.stoppedAt),
+    plugin: i.plugin,
+    gateway: i.stoppedAt === null ? i.gateway : { ready: false, guilds: i.gateway.guilds },
+    last_gateway_at: heartbeatIso(i.lastGatewayAt),
+    last_inbound_at: heartbeatIso(i.lastInboundAt),
+    last_reply_at: heartbeatIso(i.lastReplyAt),
+    ears_off: heartbeatEarsOff(i.local),
+    unlocked: [...i.unlocked].filter(([, u]) => u.until > i.now)
+      .map(([room, u]) => ({ room, until: heartbeatIso(u.until) })),
+    joined_threads: i.joined,
+    static_mode: i.staticMode,
+    rival_pid: i.rivalPid,
+  }
+}
+
+// Did another live body write the file we are about to replace? (prev = the file as read, alive = pid check)
+function heartbeatRival(prev: { pid?: unknown; stopped_at?: unknown } | null, myPid: number,
+  alive: (pid: number) => boolean): number | null {
+  const pid = typeof prev?.pid === 'number' ? prev.pid : null
+  if (pid === null || pid === myPid || prev?.stopped_at) return null
+  return alive(pid) ? pid : null
+}
+
+// Atomic: a reader never sees half a file. The tmp name carries the pid, so two bodies never share one.
+function heartbeatWrite(file: string, data: Record<string, unknown>, pid: number): void {
+  const tmp = `${file}.${pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, file)
+}
+
+// The claude process this plugin serves: walk up the parents (claude -> bun run -> bun server.ts) until one is claude.
+function heartbeatClaudePid(pid: number, parent: (pid: number) => { ppid: number; comm: string } | null): number | null {
+  let p = pid
+  for (let hop = 0; hop < 6; hop++) {
+    const up = parent(p)
+    if (!up || up.ppid <= 1) return null
+    const me = parent(up.ppid)
+    if (me && /(^|\/)claude$/i.test(me.comm.trim())) return up.ppid
+    p = up.ppid
+  }
+  return null
+}
+// heartbeat:end
+
+const STATUS_FILE = join(STATE_DIR, 'status.json')
+const heartbeatStartedAt = Date.now()
+// laris-co patch (catch-up, 2026-11-07): the previous run's heartbeat, read once before this run overwrites it.
+const catchupPrev: { updated_at?: string | null; stopped_at?: string | null; last_inbound_at?: string | null; started_at?: string | null } | null =
+  (() => { try { return JSON.parse(readFileSync(STATUS_FILE, 'utf8')) } catch { return null } })()
+let heartbeatLastGatewayAt: number | null = null
+let heartbeatLastInboundAt: number | null = null
+let heartbeatLastReplyAt: number | null = null
+
+function heartbeatParent(pid: number): { ppid: number; comm: string } | null {
+  const r = spawnSync('ps', ['-o', 'ppid=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 })
+  const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(r.stdout ?? '')
+  return m ? { ppid: Number(m[1]), comm: m[2]! } : null
+}
+
+// Where the claude it serves runs (its cwd), found once: /proc on Linux, lsof on macOS, else PWD.
+function heartbeatCwd(pid: number | null): string | null {
+  if (pid) {
+    try { return realpathSync(`/proc/${pid}/cwd`) } catch {}
+    const r = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 3000 })
+    const n = (r.stdout ?? '').split('\n').find(l => l.startsWith('n'))
+    if (n) return n.slice(1)
+  }
+  return process.env.PWD ?? null
+}
+
+let heartbeatWho: { claudePid: number | null; cwd: string | null } | null = null
+let heartbeatRivalPid: number | null = null
+const heartbeatAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch (e) {
+  return (e as NodeJS.ErrnoException).code === 'EPERM' } }
+function heartbeatNow(stoppedAt: number | null = null): void {
+  try {
+    if (!heartbeatWho) {
+      const claudePid = heartbeatClaudePid(process.pid, heartbeatParent)
+      heartbeatWho = { claudePid, cwd: heartbeatCwd(claudePid) }
+    }
+    let local = {}
+    try { local = earsRead(ACCESS_LOCAL_FILE) } catch {}
+    let prev = null
+    try { prev = JSON.parse(readFileSync(STATUS_FILE, 'utf8')) } catch {}
+    const rival = heartbeatRival(prev, process.pid, heartbeatAlive)
+    if (rival !== null) heartbeatRivalPid = rival
+    else if (heartbeatRivalPid !== null && !heartbeatAlive(heartbeatRivalPid)) heartbeatRivalPid = null
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    heartbeatWrite(STATUS_FILE, heartbeatBuild({
+      oracle: myOracle(), stateDir: basename(STATE_DIR),
+      bot: client.user ? { id: client.user.id, username: client.user.username } : null,
+      host: hostname(), pid: process.pid, ...heartbeatWho,
+      herdr: { session: process.env.HERDR_SESSION ?? null, pane: process.env.HERDR_PANE_ID ?? null },
+      startedAt: heartbeatStartedAt, now: Date.now(),
+      plugin: { ...statusPlugin(import.meta.path), sha8: statusPatch() },
+      gateway: { ready: client.isReady(), guilds: client.guilds.cache.size },
+      lastGatewayAt: heartbeatLastGatewayAt, lastInboundAt: heartbeatLastInboundAt, lastReplyAt: heartbeatLastReplyAt,
+      local, unlocked, joined: readJoined().length, staticMode: STATIC, stoppedAt, rivalPid: heartbeatRivalPid,
+    }), process.pid)
+  } catch (err) {
+    process.stderr.write(`discord: heartbeat write failed: ${err}\n`)
+  }
+}
+setInterval(() => heartbeatNow(), HEARTBEAT_EVERY_MS).unref()
+
 // laris-co patch: history backfill, the Hermes way. Read back from the tag until this bot's own
 // last message (where its previous turn ended) or `limit` messages, oldest first, one line each.
 // Senders not on the allowlist are marked [unverified]. Goes in meta, so a sender cannot forge it.
@@ -519,7 +885,7 @@ async function historyBackfill(msg: Message, limit: number, allowed: string[]): 
     const lines: string[] = []
     for (const m of got.values()) {               // newest first
       if (m.author.id === client.user?.id) break   // our last turn: stop here
-      if (client.user && m.mentions.has(client.user)) break   // the last tag: its answer went to a thread
+      if (client.user && m.mentions.has(client.user, { ignoreEveryone: true })) break   // the last tag: its answer went to a thread
       const text = (m.cleanContent || (m.attachments.size ? '(attachment)' : '')).replace(/\s+/g, ' ').slice(0, 300)
       if (!text) continue
       const tag = m.author.bot ? ' [bot]' : allowed.includes(m.author.id) ? '' : ' [unverified]'
@@ -694,19 +1060,55 @@ function setKicked(id: string, on: boolean): void {
   writeFileSync(KICKED_FILE, JSON.stringify([...s]) + '\n', { mode: 0o600 })
 }
 
+// laris-co patch (Nat 2026-11-07, #portal "idea still working?"): who the host adds to a thread opened with "!!<name>".
+// Every trusted human (allowFrom), except: a thread Nat opens does NOT get catbutter, and a thread catbutter opens
+// DOES get Nat (even if Nat is missing from allowFrom). Pure, so it can be tested without Discord.
+const NAT_ID = '691531480689541170'
+const CATBUTTER_ID = '917019242094817301'
+export function threadOpenMembers(opener: string, allowFrom: readonly string[]): string[] {
+  let ids = [...allowFrom]
+  if (opener === NAT_ID) ids = ids.filter(id => id !== CATBUTTER_ID)
+  if (opener === CATBUTTER_ID && !ids.includes(NAT_ID)) ids.push(NAT_ID)
+  return [...new Set(ids)]
+}
+
+// laris-co patch (2026-11-07, #repo pilot): who counts as a trusted human in a thread. A soul body's top-level allowFrom
+// is empty on purpose (no DMs) and Nat/catbutter sit on the thread's row, so "!join @Neo" was dropped and a joined thread
+// still ignored them. A human on this thread's row (or its parent's) counts too. An empty row allowFrom ("anyone may
+// talk here") trusts no one extra.
+function roomRowTrusts(msg: Message, access: Access): boolean {
+  const parentId = msg.channel.isThread() ? msg.channel.parentId : null
+  const row = access.groups?.[msg.channelId] ?? (parentId ? access.groups?.[parentId] : undefined)
+  return !!row?.allowFrom?.includes(msg.author.id)
+}
+function trustedInThread(msg: Message, access: Access): boolean {
+  if (access.allowFrom.includes(msg.author.id)) return true
+  return msg.channel.isThread() && roomRowTrusts(msg, access)
+}
+// Commands that change more than one thread (!ears writes access.local.json, !sleep, a role roll call) stay with the
+// top-level list. Only a body that HAS no top-level list (a soul body: allowFrom [] so DMs stay closed) takes the humans
+// on its room row instead, so Nat can still !ears / !status / !sleep a soul. Hosts and main bodies are unchanged.
+function trustedForCommands(msg: Message, access: Access): boolean {
+  if (access.allowFrom.includes(msg.author.id)) return true
+  return access.allowFrom.length === 0 && roomRowTrusts(msg, access)
+}
+
 // Returns a gate result when the message is about kicking this bot in a thread, else null.
 function kickGate(msg: Message, access: Access): GateResult | null {
   if (!msg.channel.isThread() || !client.user) return null
   const me = client.user.id
   const id = msg.channelId
-  const human = access.allowFrom.includes(msg.author.id)
+  const human = trustedInThread(msg, access)
   // about this bot: it is tagged by name, or a role it holds is tagged (Nat 2026-10-31: "we should can kick the role?"),
   // so "!kick @media-team" sends out every media bot. Checked here, before the roll call, which would pull them back in.
   const mine = msg.guild?.members.me?.roles.cache
   const aboutMe = msg.mentions.users.has(me) || (!!mine && msg.mentions.roles.some(r => mine.has(r.id)))
   const text = msg.content.trim().toLowerCase()
-  // a human removes this bot from the thread's member list (Discord posts a "removed X from the thread" message)
-  if (human && aboutMe && msg.type === MessageType.RecipientRemove) {
+  // this bot is removed from the thread's member list (Discord posts a "removed X from the thread" message).
+  // Any remover counts, human or bot: Discord itself only lets someone with Manage Threads do it, and on 2026-11-03
+  // Hermes (a bot) removed 17 bots for Nat; with the old human-only check none of them saved the kick and they kept
+  // hearing the thread through the parent channel ("kicked but you still got this message?").
+  if (aboutMe && msg.type === MessageType.RecipientRemove) {
     setKicked(id, true); setJoined(id, false)
     return { action: 'drop' }
   }
@@ -729,7 +1131,7 @@ function kickGate(msg: Message, access: Access): GateResult | null {
 
 function isRollCall(msg: Message, access: Access): boolean {
   const roles = access.roleCall ?? []
-  if (!roles.length || !access.allowFrom.includes(msg.author.id)) return false
+  if (!roles.length || !trustedForCommands(msg, access)) return false
   const mine = msg.guild?.members.me?.roles.cache
   return roles.some(r => msg.mentions.roles.has(r) && (!mine || mine.has(r)))
 }
@@ -769,6 +1171,136 @@ function summonName(msg: Message): string {
     return slug(msg.mentions.members?.get(id)?.displayName ?? u.globalName ?? u.username)
   })
   return [...new Set(names.filter(Boolean))].join(' + ').slice(0, 90)
+}
+
+// laris-co patch (Nat 2026-11-07): who a "!!name" thread adds. The opener always; the owner (allowFrom[0], Nat) too
+// when someone else opened it. Nat opens -> [Nat]. catbutter opens -> [catbutter, Nat].
+export function bangThreadMembers(opener: string, allowFrom: string[]): string[] {
+  const owner = allowFrom[0]
+  return owner && owner !== opener ? [opener, owner] : [opener]
+}
+
+// laris-co patch (Nat 2026-11-07): "!wt <name>" / "!wt-close <name>" in a layout-9 repo channel. See the call site.
+export function wtCommand(text: string): { close: boolean; name: string } | null {
+  const m = /^!wt(-close)?\s+([a-z0-9][a-z0-9._-]{0,48})$/i.exec(text.trim())
+  return m ? { close: !!m[1], name: m[2]!.toLowerCase() } : null
+}
+
+function wtHandle(msg: Message, access: Access, roomPolicy: GroupPolicy | undefined): boolean {
+  const text = msg.content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim()
+  const cmd = wtCommand(text)
+  if (!cmd) return false
+  const repo = (roomPolicy as any)?.repo as string | undefined
+  if (!access.host || !repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return false      // not a repo room: let it pass on
+  if (!access.allowFrom.includes(msg.author.id)) return true                         // trusted humans only, silently
+  const channel = msg.channel.isThread() ? (msg.channel as any).parentId as string : msg.channelId
+  const r = wtStart(cmd, repo, channel, msg.channelId, msg.id, bangThreadMembers(msg.author.id, access.allowFrom))
+  void msg.react(r.ok ? r.emoji : '⚠️').catch(() => {})
+  return true
+}
+
+// laris-co patch (Nat 2026-11-07): the worktree threads this host forwards for a repo: name (wt folder) -> thread id.
+// Feeds /wt-close autocomplete and lets a pasted thread mention or link stand for its name.
+export function wtThreads(access: Access, repo: string): { name: string; thread: string }[] {
+  const out: { name: string; thread: string }[] = []
+  for (const [id, g] of Object.entries(access.groups ?? {})) {
+    const f = (g as any)?.forwardTo as string | undefined
+    if (!f || (g as any).deny) continue
+    const m = /\/wt\/([^/]+)\/?$/.exec(f)
+    if (m && f.includes(`/${repo}/`)) out.push({ name: m[1]!, thread: id })
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+// "#name", "<#id>", a discord.com/channels/... link, or the name itself -> the plain worktree name.
+export function wtName(raw: string, threads: { name: string; thread: string }[]): string {
+  const t = raw.trim()
+  const id = /<#(\d+)>/.exec(t)?.[1] ?? /discord\.com\/channels\/\d+\/(?:\d+\/)?(\d+)\/?$/.exec(t)?.[1]
+  if (id) return threads.find(x => x.thread === id)?.name ?? t
+  // Nat 2026-11-07 23:51: "/wt open" refused his name: slugify instead of refusing (spaces, capitals, symbols -> '-')
+  return t.replace(/^#/, '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9._-]+/g, '-').replace(/-+/g, '-')
+    .replace(/^[-._]+|[-._]+$/g, '').slice(0, 49)
+}
+
+// laris-co patch (Nat 2026-11-07, "go slash /wt"): the one place that starts "maw soul in|wt|wt-close" detached.
+// Used by "!wt" and by the /wt and /wt-close slash commands. The result is posted to chatId (as a reply when replyTo).
+// laris-co patch (Nat 2026-11-08, /soul in a /wt thread said "not a repo room"): a worktree or soul thread has its OWN
+// row (forwardTo, ears) without `repo`, so the repo comes from that row, else from the parent room's row.
+export function roomRepo(access: Access, ch: any, policy?: any): string | undefined {
+  return (policy?.repo ?? (ch?.isThread?.() ? (access.groups as any)?.[ch.parentId]?.repo : undefined)) as string | undefined
+}
+
+// /ls sleep + wake menus (Nat 2026-11-08 "if /ls button can we list button to sleep / wake"): worktree agents that are
+// idle/done can sleep (tools/space-sleep.sh: wake card, /exit, the space stays); sleepers of this session can wake.
+// The host body never appears. Picking runs at once (Nat or catbutter), detached.
+export function lsSleepMenus(): any[] {
+  const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+  const rows: any[] = []
+  try {
+    const ag = JSON.parse(spawnSync('herdr', ['--session', 'laris-co', 'agent', 'list'], { encoding: 'utf8', timeout: 8000 }).stdout).result.agents
+    // team member bodies (<x>-team/wt/<oracle>) are bot bodies woken by team-wake, not here
+    const awake = ag.filter((a: any) => /\/wt\//.test(a.cwd ?? '') && !/-team\/wt\//.test(a.cwd ?? '') && ['idle', 'done'].includes(a.agent_status)).slice(0, 25)
+    if (awake.length) rows.push({ type: 1, components: [{ type: 3, custom_id: 'lsx:sleep', placeholder: '💤 sleep an agent (idle ones)', options: awake.map((a: any) => {
+      const c = String(a.cwd); const lab = `${c.split('/wt/')[0]!.split('/').pop()}/${c.split('/wt/')[1]}`
+      return { label: `💤 ${lab}`.slice(0, 100), value: a.pane_id, description: `${a.pane_id} · ${a.agent_status}` } }) }] })
+  } catch {}
+  try {
+    const out = spawnSync('bash', [join(team, 'tools', 'space-sleep.sh'), 'list'], { encoding: 'utf8', timeout: 8000 }).stdout
+    const asleep = String(out).split('\n').filter(Boolean).map(l => l.split('\t')[0]!).slice(0, 25)
+    if (asleep.length) rows.push({ type: 1, components: [{ type: 3, custom_id: 'lsx:wake', placeholder: '☀️ wake a sleeping agent', options: asleep.map(l => ({ label: `☀️ ${l.replace('--', '/')}`.slice(0, 100), value: l.slice(0, 100) })) }] })
+  } catch {}
+  return rows
+}
+
+export function wtStart(cmd: { close: boolean; name: string }, repo: string, channel: string, chatId: string, replyTo?: string,
+    members: string[] = [], here?: string):
+    { ok: boolean; emoji: string; what: string } {
+  const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+  const ghq = process.env.GHQ_ROOT || '/opt/Code'
+  const isOracle = !cmd.close && cmd.name.endsWith('-oracle')
+    && existsSync(join(ghq, 'github.com', 'laris-co', cmd.name, 'CLAUDE.md'))
+  // /wt here (Nat 2026-11-08 "go here"): use THIS thread. A soul gets ears on it (every line) and the host row for the
+  // thread goes tag-only (one voice); a worktree gets the forward row on it (maw soul wt --thread).
+  const hereSoul = here ? `ears "$NAME" "$REPO" add "$HERE" --all --yes && python3 -c "$HERE_PY" "$HERE"` : ''
+  const herePy = [
+    'import json, os, shutil, sys, time',
+    'p = os.path.expanduser("~/.claude/channels/laris-labs-oracle/access.local.json")',
+    'shutil.copy(p, p + ".bak-" + time.strftime("%Y%m%d-%H%M%S") + "-wt-here")',
+    'd = json.load(open(p)); g = d.setdefault("groups", {})',
+    'g[sys.argv[1]] = {"requireMention": True, "allowFrom": ["691531480689541170", "917019242094817301"], "note": "/wt here: a soul answers this thread; Laris tag only"}',
+    'json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)',
+    'print("thread " + sys.argv[1] + ": Laris tag only")',
+  ].join('\n')
+  const verb = cmd.close ? `wt-close "$NAME" "$REPO" --yes`
+    : here && isOracle ? hereSoul
+    : here ? `wt "$NAME" "$REPO" --thread="$HERE" --yes`
+    : isOracle ? `in "$NAME" "$REPO" --channel="$CHAN" --deny-main --yes`
+    : `wt "$NAME" "$REPO" --channel="$CHAN" --yes`
+  const what = cmd.close ? 'closing' : here && isOracle ? 'soul joins this thread' : here ? 'worktree for this thread'
+    : isOracle ? 'bringing the soul in' : 'new worktree'
+  const emoji = cmd.close ? '📦' : isOracle ? '🧬' : '🌱'
+  // Values travel as env vars (never spliced into the script); the tail of the output is posted back as the answer.
+  const script = `out=$(maw soul ${verb} 2>&1); rc=$?; ` +
+    `tail=$(printf '%s\\n' "$out" | grep -E 'RESULT|done:|thread|error|✗|stop|already|unlink first|refuse|not |added|tag only' | tail -4); ` +
+    // Nat 2026-11-07 "can you auto invite me?": add the opener (+ Nat when someone else opened it) to the new thread
+    `tid=$(printf '%s\\n' "$out" | sed -n 's/.*RESULT thread=\\([0-9]*\\).*/\\1/p' | tail -1); ` +
+    `if [ -n "$tid" ] && [ -n "$MEMBERS" ]; then tok=$(pass show discord/laris-labs-oracle-token | head -1); ` +
+    `for u in $MEMBERS; do curl -s -o /dev/null -X PUT -H "Authorization: Bot $tok" "https://discord.com/api/v10/channels/$tid/thread-members/$u"; done; fi; ` +
+    `wt=$(printf '%s\\n' "$out" | sed -n 's/.*RESULT .*wt=\\([^ ]*\\).*/\\1/p' | tail -1); ` +
+    `"$TEAM/tools/discord-say.sh" "$CHAT" "$(printf '%s\\n' "\\\`!wt$CLOSE $NAME\\\` rc=$rc" "$tail" | head -c 1800)" ${replyTo ? '--reply "$MSG"' : ''} ` +
+    `$( [ -n "$wt" ] && [ -z "$CLOSE" ] && echo --focus "$REPO" "wt/$(basename "$wt")" )`
+  try {
+    const out = openSync(join(STATE_DIR, 'wt.log'), 'a')
+    spawn('bash', ['-lc', script], {
+      detached: true, stdio: ['ignore', out, out],
+      env: { ...process.env, NAME: cmd.name, REPO: repo, CHAN: channel, CHAT: chatId, MSG: replyTo ?? '',
+        TEAM: team, HERE: here ?? '', HERE_PY: herePy, CLOSE: cmd.close ? '-close' : (here ? ' here' : ''), MEMBERS: cmd.close || here ? '' : members.filter(m => /^\d+$/.test(m)).join(' ') },
+    }).unref()
+    return { ok: true, emoji, what }
+  } catch (e) {
+    process.stderr.write(`discord: wt start failed: ${e}\n`)
+    return { ok: false, emoji: '⚠️', what }
+  }
 }
 
 // The room's thread that already carries this name (active, else archived and then unarchived), or null.
@@ -812,7 +1344,7 @@ const SETUP_RE = /^!!setup$/i
 // Bots the host has not seen are not in the member cache (no privileged intent, no full fetch). Ask Discord for each
 // bot laris-team knows (oracles/*/config.yaml client_id), one member at a time: a single-member fetch needs no intent.
 async function warmKnownBots(guild: NonNullable<Message['guild']>, access: Access) {
-  const team = oracleTeamDir(access)
+  const team = larisTeamDir(access)
   if (!team) return
   let names: string[] = []
   try { names = readdirSync(join(team, 'oracles')) } catch { return }
@@ -843,7 +1375,7 @@ const setupSlug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').rep
 // "lawer-oracle" while its config is lawyer-oracle, so the scan could not give its --thread line)
 function knownOracleIds(access: Access): Map<string, string> {
   const out = new Map<string, string>()
-  const team = oracleTeamDir(access)
+  const team = larisTeamDir(access)
   if (!team) return out
   let names: string[] = []
   try { names = readdirSync(join(team, 'oracles')) } catch { return out }
@@ -897,21 +1429,23 @@ async function oracleThreads(room: any, guild: NonNullable<Message['guild']>, ac
   return out
 }
 
-// The team checkout (holds oracles/<name>/config.yaml): access.teamDir, else an answerCmd's ".../tools/discord-say.sh",
-// else ORACLE_TEAM_DIR (LARIS_TEAM_DIR still read for old installs).
-function oracleTeamDir(access: Access): string | null {
+// The laris-team checkout: from an answerCmd that access-sync wrote (".../tools/discord-say.sh"), else LARIS_TEAM_DIR.
+function larisTeamDir(access: Access): string | null {
   if (access.teamDir) return access.teamDir   // written by access-sync (2026-11-01)
   for (const pol of [...Object.values(access.groups ?? {}), ...Object.values(access.guilds ?? {})]) {
     const m = /(\/\S*?)\/tools\/discord-say\.sh/.exec(pol?.answerCmd ?? '')
     if (m) return m[1]!
   }
-  return process.env.ORACLE_TEAM_DIR || process.env.LARIS_TEAM_DIR || null
+  return process.env.LARIS_TEAM_DIR || null
 }
 
-// This bot's oracle name, from its state dir (~/.claude/channels/<oracle>), else the host's.
+// This bot's oracle name: DISCORD_ORACLE (set by a body's launch.sh, e.g. soul-in-repo bodies whose state dir
+// is a plain ".discord"), else its state dir (~/.claude/channels/<oracle>), else the host's.
 function myOracle(): string {
+  const env = process.env.DISCORD_ORACLE?.trim()
+  if (env) return env
   const state = basename(STATE_DIR)
-  return /-oracle$/.test(state) ? state : (process.env.ORACLE_HOST_NAME || 'host-oracle')
+  return /-oracle$/.test(state) ? state : 'laris-labs-oracle'
 }
 
 async function guildSetup(msg: Message, access: Access): Promise<void> {
@@ -980,9 +1514,9 @@ async function guildSetup(msg: Message, access: Access): Promise<void> {
 
   // 3. name check: "CMMC Avengers" -> cmmc-avengers-oracle
   const slug = setupSlug(guild.name) + '-oracle'
-  const team = oracleTeamDir(access)
+  const team = larisTeamDir(access)
   const exists = team ? existsSync(join(team, 'oracles', slug, 'config.yaml')) : null
-  const nameLine = exists === null ? `- oracles/${slug}: unknown (team dir not found)`
+  const nameLine = exists === null ? `- oracles/${slug}: unknown (laris-team dir not found)`
     : `- oracles/${slug}/config.yaml: ${exists ? 'ok' : 'missing'}`
 
   // 4. rule scan. Bots come from the member cache, warmed with the bots laris-team knows (warmKnownBots).
@@ -1015,8 +1549,8 @@ async function guildSetup(msg: Message, access: Access): Promise<void> {
         const cfg = team ? existsSync(join(team, 'oracles', t.slug, 'config.yaml')) : null
         const give = `\`just guild-setup ${t.slug} ${guild.id} --thread ${t.id}\``
         return [`- ${t.slug}: thread ${t.id} (${t.how})`,
-          cfg === null ? `  - ${give} (team dir not found, check oracles/${t.slug})`
-            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in the team dir: make the bot first`]
+          cfg === null ? `  - ${give} (laris-team dir not found, check oracles/${t.slug})`
+            : cfg ? `  - ${give}` : `  - no oracles/${t.slug}/config.yaml in laris-team: make the bot first`]
       }) : ['- no bot named "... Oracle" in the member cache']),
     '',
     `**My permissions**`,
@@ -1116,7 +1650,7 @@ async function gate(msg: Message): Promise<GateResult> {
     if (msg.channel.isThread()) { setJoined(msg.channelId, true); setKicked(msg.channelId, false) }
     return { action: 'deliver', access }
   }
-  if (readJoined().includes(msg.channelId) && access.allowFrom.includes(msg.author.id)) {
+  if (readJoined().includes(msg.channelId) && trustedInThread(msg, access)) {
     const text = msg.content.trim().toLowerCase()
     if (text === '!leave') {
       setJoined(msg.channelId, false)
@@ -1136,7 +1670,7 @@ async function gate(msg: Message): Promise<GateResult> {
   const policy = findGroupPolicy(access, msg.channel)
   if (!policy) return { action: 'drop' }
   const groupAllowFrom = policy.allowFrom ?? []
-  const requireMention = isOwnThread(msg.channel) ? false : (policy.requireMention ?? true)
+  const requireMention = ownThreadHere(access, msg.channel) ? false : (policy.requireMention ?? true)
   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
     return { action: 'drop' }
   }
@@ -1146,14 +1680,20 @@ async function gate(msg: Message): Promise<GateResult> {
   }
   // laris-co patch (Nat 2026-10-31: "how to make not tag? it should smooth?"): a trusted human who tags this bot
   // inside a thread keeps it there: it joins the thread and hears the rest without a tag, until !leave or !kick.
-  if (requireMention && msg.channel.isThread() && access.allowFrom.includes(senderId)) {
+  // Only a tag of this bot or a role it holds joins: @here / @everyone still wake the bot for this one message but do not join it
+  // (2026-11-03: one @here in god's-eyes-os joined every bot to the thread, Glyph's root cause).
+  if (requireMention && msg.channel.isThread() && trustedInThread(msg, access)
+      && !!client.user && (msg.mentions.users.has(client.user.id)
+        || msg.mentions.roles.some(r => !!msg.guild?.members.me?.roles.cache.has(r.id)))) {
     setJoined(msg.channelId, true)
   }
   return { action: 'deliver', access }
 }
 
 async function isMentioned(msg: Message, extraPatterns?: string[]): Promise<boolean> {
-  if (client.user && msg.mentions.has(client.user)) return true
+  // laris-co patch (Nat's @here test, 2026-11-07: 11 bots answered in one thread): discord.js counts @here/@everyone
+  // in mentions.has() unless told not to, so every bot with a requireMention row heard @here. Only a real tag counts.
+  if (client.user && msg.mentions.has(client.user, { ignoreEveryone: true })) return true
 
   // Reply to one of our messages counts as an implicit mention.
   const refId = msg.reference?.messageId
@@ -1524,6 +2064,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             })
             noteSent(sent.id)
             sentIds.push(sent.id)
+            heartbeatLastReplyAt = Date.now() // laris-co patch (#95)
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -1619,6 +2160,7 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  heartbeatNow(Date.now()) // laris-co patch (#95): stopped_at, so `just bots` says "stopped", not "dead"
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(client.destroy()).finally(() => process.exit(0))
 }
@@ -1627,10 +2169,13 @@ process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// laris-co: board, new-thread welcome, /close /status /office /lean /soul helpers live in ./laris/rooms.ts
+installRooms()
+
+
 client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
-
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
@@ -1639,10 +2184,258 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   // bot (tools/slash-register.py, from config.yaml `slash:`) reaches Claude as an ordinary channel message
   // "/<name> <text> --<choice>", so the oracle's own skill of that name runs. Same trust rule as the buttons:
   // only a user in access.allowFrom; everyone else gets an ephemeral "Not authorized."
+  // laris-co patch (Nat 2026-11-07): /wt-close name: suggests the worktree threads of this repo room; /wt name: too.
+  if (interaction.isAutocomplete()) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) { await interaction.respond([]).catch(() => {}); return }
+    const ch: any = interaction.channel
+    const policy = ch ? findGroupPolicy(access, ch) : undefined
+    const repo = roomRepo(access, ch, policy)
+    const typed = String(interaction.options.getFocused() ?? '').toLowerCase()
+    if (interaction.commandName === 'soul') {
+      // oracles that have a soul repo (laris-co/<o>/CLAUDE.md) and a config in laris-team/oracles
+      const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+      const ghq = process.env.GHQ_ROOT || '/opt/Code'
+      let names: string[] = []
+      try { names = readdirSync(join(team, 'oracles')).filter(n => n.endsWith('-oracle')
+        && existsSync(join(ghq, 'github.com', 'laris-co', n, 'CLAUDE.md'))) } catch {}
+      await interaction.respond(names.filter(n => n.includes(typed)).slice(0, 25).map(n => ({ name: n, value: n }))).catch(() => {})
+      return
+    }
+    const list = repo ? wtThreads(access, repo) : []
+    await interaction.respond(list.filter(x => x.name.includes(typed)).slice(0, 25)
+      .map(x => ({ name: x.name, value: x.name }))).catch(() => {})
+    return
+  }
   if (interaction.isChatInputCommand()) {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    // laris-co patch (Nat 2026-11-07, "go slash /wt but prevent this" = "The application did not respond"):
+    // /wt and /wt-close are answered by the PLUGIN at once (ephemeral), never forwarded to Claude, so a busy or
+    // mid-turn Claude can never make Discord time out. The work runs detached; the result is posted to the channel.
+    // laris-co patch (Nat 2026-11-08: "make slash /soul too? and should have icon if have soul?"): /soul add|rm|ls.
+    // Acked by the plugin at once; the work runs detached in tools/soul-slash.sh (args, never spliced).
+    if (interaction.commandName === 'soul') {
+      // Nat 2026-11-08 "can i type to get odin?": the picker holds 25 oracles; /soul oracle:<typed, autocompleted> = Add
+      const sub = interaction.options.getSubcommand(false) ?? (interaction.options.getString('oracle') ? 'add' : 'pick')
+      const ch: any = interaction.channel
+      const policy = ch ? findGroupPolicy(access, ch) : undefined
+      const repo = roomRepo(access, ch, policy)
+      if (!access.host || !repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+        await interaction.reply({ content: '⚠️ not a repo room (no `repo` in the host row here)', ephemeral: true }).catch(() => {})
+        return
+      }
+      const inThread = !!ch?.isThread?.()
+      const channel = inThread ? ch.parentId as string : interaction.channelId
+      // laris-co patch (Nat 2026-11-08: "i think we just /soul and interactive?"): a bare /soul opens a picker
+      // (oracle select + Add / Remove / List all buttons), only the caller sees it. The buttons run soul-slash.sh.
+      if (sub === 'pick') {
+        await interaction.deferReply({ ephemeral: true }).catch(() => {})
+        await interaction.editReply(soulPicker(repo, inThread, ch?.name as string | undefined)).catch(() => {})
+        return
+      }
+      if (sub === 'ls') {
+        await interaction.deferReply({ ephemeral: true }).catch(() => {})
+        const r = spawnSync('bash', ['-lc', 'maw soul ls "$REPO" 2>&1 | tail -30'], { encoding: 'utf8', timeout: 20000,
+          env: { ...process.env, REPO: repo } })
+        await interaction.editReply({ content: '```\n' + String(r.stdout || r.stderr || 'no output').slice(0, 1800) + '\n```' }).catch(() => {})
+        return
+      }
+      const o = String(interaction.options.getString('oracle') ?? '').trim().toLowerCase()
+      if (!/^[a-z0-9-]+-oracle$/.test(o)) {
+        await interaction.reply({ content: `⚠️ pick an oracle from the list (got \`${o.slice(0, 40)}\`)`, ephemeral: true }).catch(() => {})
+        return
+      }
+      if (sub === 'rm' && !inThread) {
+        await interaction.reply({ content: '⚠️ `/soul rm` works inside the thread to take the soul out of', ephemeral: true }).catch(() => {})
+        return
+      }
+      const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+      try {
+        const out = openSync(join(STATE_DIR, 'soul.log'), 'a')
+        spawn('bash', [join(team, 'tools', 'soul-slash.sh'), sub, o, repo, inThread ? interaction.channelId : '', channel,
+          interaction.channelId], { detached: true, stdio: ['ignore', out, out] }).unref()
+        await interaction.reply({ ephemeral: true, content: sub === 'add'
+          ? (inThread ? `🧬 ${o} joins this thread (every line), Laris goes tag-only, the thread gets its icon` : `🧬 bringing ${o} into ${repo} (its own thread)`)
+          : `📤 taking ${o} out of this thread; Laris answers again` }).catch(() => {})
+      } catch (e) {
+        await interaction.reply({ content: `⚠️ /soul failed to start: ${e}`, ephemeral: true }).catch(() => {})
+      }
+      return
+    }
+    // laris-co patch (Nat 2026-11-08: "we shuld have /close in a thread"): /close asks first (Close / Cancel, only the
+    // caller sees it). Worktree thread -> wt-close; soul thread (icon) -> soul rm + archive; plain thread -> archive.
+    // Never the office thread, never a channel.
+    // laris-co patch (Nat 2026-11-08 "make /status"): what lives in this repo room, only the caller sees it
+    if (interaction.commandName === 'lean') {
+      const ch: any = interaction.channel
+      const room = ch?.isThread?.() ? ch.parent : ch
+      if (!(access.groups as any)?.[room?.id]?.repo) { await interaction.reply({ content: '⚠️ /lean works in a repo room', ephemeral: true }).catch(() => {}); return }
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const d = await leanDetect(access, room)
+      const n = d.threads.length + (d.office ? 1 : 0) + d.stale
+      leanPlans.set(interaction.user.id, { room: room.id, threads: d.threads, office: d.office, stale: d.stale })
+      await interaction.editReply({ content: d.text + (n ? '' : '\n\n✨ already lean'), components: n ? [{ type: 1, components: [
+        { type: 2, style: 4, custom_id: 'lean:go', label: `Lean ✓ (${n})` }, { type: 2, style: 2, custom_id: 'lean:no', label: 'Cancel' }] }] : [] } as any).catch(() => {})
+      return
+    }
+    // laris-co patch (Nat 2026-11-08 "so ... make a cli? slash command?" -> "build and merge all please asap"):
+    // /promote in a talk thread: the CLI's plan (maw soul promote --dry), a souls picker, Promote ✓ (laris/promote.ts)
+    if (interaction.commandName === 'promote') {
+      const ch: any = interaction.channel
+      if (!ch?.isThread?.()) {
+        await interaction.reply({ content: '⚠️ `/promote` works inside the talk thread to promote (a `!!name` thread)', ephemeral: true }).catch(() => {})
+        return
+      }
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const t = promoteTarget(String(interaction.options.getString('name') ?? ''))
+      const p = await promoteMake(interaction.channelId, t.owner, t.name, [])
+      promotePlans.set(interaction.user.id, p)
+      await interaction.editReply(promoteView(access, p)).catch(() => {})
+      return
+    }
+    // /archive (Nat 2026-11-08 "we should have archive to handle this"): put a finished repo room away (laris/archive.ts)
+    // /ls (Nat 2026-11-08 "can we list ? wt like from /status ? oh can you have maw ls?"): herdr spaces on m5 as maw ls
+    // prints them (repo → worktrees, ● = agent running). In a repo room only that repo's block; all: every repo.
+    if (interaction.commandName === 'ls') {
+      // Nat 2026-11-08 "no show all in herdr? and mark current session": every space, and this room's repo marked 👉
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const chL: any = interaction.channel
+      const repoL = roomRepo(access, chL, chL ? findGroupPolicy(access, chL) : undefined)
+      const r = spawnSync('bash', ['-lc', 'maw ls 2>&1'], { encoding: 'utf8', timeout: 20000 })
+      let lines = String(r.stdout || r.stderr || 'no output').split('\n')
+      if (repoL) {
+        const name = repoL.split('/')[1]!.toLowerCase()
+        let inside = false
+        lines = lines.map(l => {
+          const top = /^\s{4}\S+\s+(\S+)/.exec(l)
+          if (top) inside = top[1]!.toLowerCase() === name
+          return inside ? (top ? '👉' + l.slice(2) : l) : l
+        })
+      }
+      await interaction.editReply({ content: '```\n' + lines.join('\n').slice(0, 1800) + '\n```' + (repoL ? `\n-# 👉 = this room's repo (${repoL}) · ● agent running` : ''),
+        components: lsSleepMenus() } as any).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'work') {
+      // Nat 2026-11-08 "/work . in the thread": no repo (or '.') inside a repo room = this room's repo, report posted here
+      const raw = String(interaction.options.getString('repo') ?? '').trim()
+      const chW: any = interaction.channel
+      const here = !raw || raw === '.'
+      const repo = here ? (roomRepo(access, chW, chW ? findGroupPolicy(access, chW) : undefined) ?? '') : workRepo(raw)
+      if (!repo) { await interaction.reply({ content: here ? '⚠️ not a repo room: `/work repo:owner/repo`' : '⚠️ `/work repo:` owner/repo or a github.com URL', ephemeral: true }).catch(() => {}); return }
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const w = await workMake(repo, [], here ? interaction.channelId : undefined)
+      workPlans.set(interaction.user.id, w)
+      await interaction.editReply(workView(access, w)).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'archive') {
+      const ch: any = interaction.channel
+      const room = ch?.isThread?.() ? ch.parent : ch
+      const g = (access.groups as any)?.[room?.id]
+      if (!g?.repo) { await interaction.reply({ content: '⚠️ /archive works in a repo room', ephemeral: true }).catch(() => {}); return }
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const un = !!g.archived
+      archivePlans.set(interaction.user.id, { repo: g.repo, un })
+      await interaction.editReply(archiveView(g.repo, un, await archiveDry(g.repo, un))).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'ids') {
+      await interaction.reply({ ephemeral: true, allowedMentions: { parse: [] },
+        content: idsText(String(interaction.options.getString('find') ?? '')) }).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'help') {
+      await interaction.reply({ ephemeral: true, content: [
+        '**Repo room commands** (only you see this)',
+        '`/wt name:` room = new worktree + thread · thread = this thread · `neo-oracle` = a soul',
+        '`/soul` pick an oracle: Add / Remove / List all (Add puts its icon on the thread)',
+        '`/close` thread = close it · room = a list with a Close button per row',
+        '`/status` open threads + checkouts on this machine · Tidy stale ones',
+        '`/office` open the office, or close it with a summary here',
+        '`/lean` detect idle threads, a quiet office, stale wts; one Lean ✓ closes them',
+        '`/ids` every id ↔ name (rooms, threads, people, bots) · `/ids find:dustboy`',
+        '`/work repo:` a repo (or GitHub URL): its room + a report + souls',
+        '`/archive` put a finished repo room away (souls out, threads archived, room to 🗄️ Archive) · again = bring back',
+        '`/promote` in a talk thread: it becomes a repo + its own room (plan first, then Promote ✓)',
+        '-# icon on a thread = a soul lives there · 📋・board shows every room'].join('\n') }).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'office') {
+      const ch: any = interaction.channel
+      const room = ch?.isThread?.() ? ch.parent : ch
+      if (!(access.groups as any)?.[room?.id]?.repo) {
+        await interaction.reply({ content: '⚠️ /office works in a repo room', ephemeral: true }).catch(() => {}); return
+      }
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      await interaction.editReply({ content: await officeToggle(room, interaction.user.username) }).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'status') {
+      const ch: any = interaction.channel
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      await interaction.editReply(await roomStatus(access, ch?.isThread?.() ? ch.parent : ch)).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'close') {
+      const ch: any = interaction.channel
+      // in the room itself (Nat 2026-11-08: "if in channel can we call close /close it interactive to list"): a picker
+      if (!ch?.isThread?.()) {
+        if (await interactionCallback(interaction, 4, await closeRoomList(access, ch))) return
+        await interaction.reply({ ephemeral: true, ...(await closeRoomPicker(access, ch)) }).catch(() => {})
+        return
+      }
+      const kind = closeKind(access, ch)
+      if (kind.refuse) { await interaction.reply({ content: `⚠️ ${kind.refuse}`, ephemeral: true }).catch(() => {}); return }
+      await interaction.reply({ ephemeral: true, content: `**Close this thread?**\n${kind.what}\nNothing is deleted: archived threads come back with one message.`,
+        components: [{ type: 1, components: [
+          { type: 2, style: 4, custom_id: 'close:yes', label: 'Close ✓' },
+          { type: 2, style: 2, custom_id: 'close:no', label: 'Cancel' }] }] } as any).catch(() => {})
+      return
+    }
+    if (interaction.commandName === 'wt' || interaction.commandName === 'wt-close') {
+      // /wt open|close|ls (Nat 2026-11-07 "gogogo A"); a bare /wt-close is kept for old registrations.
+      // one /wt name: (Nat 2026-11-08 "now /wt should only 1?" -> "gogogogo"): in a thread = here, in the room = open.
+      // Close and ls moved to /close and /status; the subcommands still work for an old registration.
+      const sub = interaction.commandName === 'wt-close' ? 'close'
+        : (interaction.options.getSubcommand(false) ?? ((interaction.channel as any)?.isThread?.() ? 'here' : 'open'))
+      const chH: any = interaction.channel
+      if (sub === 'here' && !chH?.isThread?.()) {
+        await interaction.reply({ content: '⚠️ `/wt here` works inside a thread (use `/wt open` in the channel)', ephemeral: true }).catch(() => {})
+        return
+      }
+      if (sub === 'ls') {
+        const ch0: any = interaction.channel
+        const repo0 = roomRepo(access, ch0, ch0 ? findGroupPolicy(access, ch0) : undefined)
+        const rows = repo0 ? wtThreads(access, repo0) : []
+        await interaction.reply({ ephemeral: true, allowedMentions: { parse: [] }, content: !repo0
+          ? '⚠️ not a repo room (no `repo` in the host row here)'
+          : rows.length ? `**${repo0}**: ${rows.length} worktree thread(s)\n` + rows.map(r => `- \`${r.name}\` <#${r.thread}>`).join('\n')
+          : `**${repo0}**: no worktree threads open. \`/wt open name:<x>\`` }).catch(() => {})
+        return
+      }
+      const ch: any = interaction.channel
+      const policy = ch ? findGroupPolicy(access, ch) : undefined
+      const repo = roomRepo(access, ch, policy)
+      const name = wtName(String(interaction.options.getString('name') ?? ''), repo ? wtThreads(access, repo) : [])
+      const cmd = wtCommand(`!${sub === 'close' ? 'wt-close' : 'wt'} ${name}`)
+      if (!access.host || !repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+        await interaction.reply({ content: '⚠️ not a repo room (no `repo` in the host row here)', ephemeral: true }).catch(() => {})
+        return
+      }
+      if (!cmd) {
+        await interaction.reply({ content: `⚠️ cannot make a worktree name from \`${String(interaction.options.getString('name') ?? '').slice(0, 60)}\` (a-z 0-9 . _ - after cleanup)`, ephemeral: true, allowedMentions: { parse: [] } }).catch(() => {})
+        return
+      }
+      const channel = ch?.isThread?.() ? ch.parentId as string : interaction.channelId
+      const r = wtStart(cmd, repo, channel, interaction.channelId, undefined, bangThreadMembers(interaction.user.id, access.allowFrom),
+        sub === 'here' ? interaction.channelId : undefined)
+      await interaction.reply({ content: `${r.emoji} ${r.what}: \`${cmd.name}\` in ${repo} (result follows here)`, ephemeral: true })
+        .catch(() => {})
       return
     }
     const opts = interaction.options.data
@@ -1672,6 +2465,288 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }).catch(err => {
       process.stderr.write(`discord channel: failed to deliver slash command to Claude: ${err}\n`)
     })
+    return
+  }
+  if (interaction.isButton() && (interaction.customId === 'lean:go' || interaction.customId === 'lean:no')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) { await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {}); return }
+    const plan = leanPlans.get(interaction.user.id); leanPlans.delete(interaction.user.id)
+    if (interaction.customId === 'lean:no' || !plan) { await interaction.update({ content: 'Cancelled.', components: [] }).catch(() => {}); return }
+    await interaction.deferUpdate().catch(() => {})
+    const room: any = await client.channels.fetch(plan.room).catch(() => null)
+    const who = interaction.user.username
+    const out: string[] = []
+    for (const tid of plan.threads) {
+      const t: any = await client.channels.fetch(tid).catch(() => null)
+      if (!t || t.archived) continue
+      if (idleMin(t) <= 24 * 60) { out.push(`${t.name}: became active, kept`); continue }
+      out.push(`${t.name}: ${await closeThread(access, t, who)}`)
+    }
+    if (plan.office && room) out.push(await officeToggle(room, who))
+    if (plan.stale && room) {
+      const repo = (access.groups as any)?.[room.id]?.repo as string
+      const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+      const map: Record<string, string> = {}
+      for (const t of await roomThreads(room)) map[t.id] = t.name
+      const r = spawnSync('python3', [join(team, 'tools', 'room-status.py'), repo, '--tidy'], { encoding: 'utf8', timeout: 30000, env: { ...process.env, THREADS: JSON.stringify(map) } })
+      out.push(String(r.stdout || r.stderr || '').trim())
+    }
+    await interaction.editReply({ content: ('**/lean done**\n' + out.join('\n')).slice(0, 1900), components: [] }).catch(() => {})
+    return
+  }
+  if (interaction.isModalSubmit() && interaction.customId === 'close:modal') {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const find = (cs: any[]): string[] => { for (const c of cs ?? []) {
+      if (c?.customId === 'close:boxes') return c.values ?? []
+      const r = find(c?.components ?? (c?.component ? [c.component] : [])); if (r.length) return r } return [] }
+    const ids = find((interaction as any).components)
+    await interaction.deferReply({ ephemeral: true }).catch(() => {})
+    const who = interaction.user.username
+    const lines: string[] = []
+    for (const tid of ids) {
+      const t: any = await client.channels.fetch(tid).catch(() => null)
+      lines.push(t ? `<#${tid}>: ${await closeThread(access, t, who)}` : `<#${tid}>: not found`)
+    }
+    await interaction.editReply({ content: lines.join('\n') || 'nothing ticked' }).catch(() => {})
+    return
+  }
+  // /close and /status components: close:yes|no (in a thread), close:pick (room select), close:many, status:close
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) && /^(close|status):/.test(interaction.customId)) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const id = interaction.customId
+    const who = interaction.user.username
+    const ch: any = interaction.channel
+    if (id === 'close:no') { closePicked.delete(interaction.user.id); await interaction.update({ content: 'Cancelled.', components: [] }).catch(() => {}); return }
+    if (id === 'close:yes') {
+      const r = await closeThread(access, ch, who)
+      await interaction.update({ content: r, components: [] }).catch(() => {})
+      return
+    }
+    const room = ch?.isThread?.() ? ch.parent : ch
+    if (id === 'close:done') { await interactionCallback(interaction, 7, { flags: 32768, components: [{ type: 10, content: 'Done.' }] }); return }
+    if (id === 'close:all') {
+      const ts = (await roomThreads(room)).filter((t: any) => String(t.name).toLowerCase() !== 'office' && !closeKind(access, t).refuse)
+      await interactionCallback(interaction, 7, { flags: 32768, components: [
+        { type: 10, content: `**Close all ${ts.length} threads in <#${room.id}>?**\n${ts.map((t: any) => `- ${t.name}`).join('\n')}\n-# office stays · nothing is deleted (archived)` },
+        { type: 1, components: [{ type: 2, style: 4, custom_id: 'close:allyes', label: `Yes, close ${ts.length}` },
+          { type: 2, style: 2, custom_id: 'close:refresh', label: 'Back' }] }] })
+      return
+    }
+    if (id === 'close:allyes') {
+      await interaction.deferUpdate().catch(() => {})
+      const ts = (await roomThreads(room)).filter((t: any) => String(t.name).toLowerCase() !== 'office' && !closeKind(access, t).refuse)
+      const out: string[] = []
+      for (const t of ts) out.push(`${t.name}: ${await closeThread(access, t, who)}`)
+      await interaction.editReply({ components: [{ type: 10, content: ('**Closed ' + ts.length + '**\n' + out.join('\n')).slice(0, 1900) }] } as any).catch(() => {})
+      return
+    }
+    if (id === 'close:refresh') { await interactionCallback(interaction, 7, await closeRoomList(access, room)); return }
+    if (id.startsWith('close:one:')) {
+      const tid = id.slice(10)
+      const t: any = await client.channels.fetch(tid).catch(() => null)
+      const r = t ? await closeThread(access, t, who) : 'not found'
+      await new Promise(res => setTimeout(res, 800))   // let the archive land before the list is redrawn
+      await interactionCallback(interaction, 7, await closeRoomList(access, room, `${t ? t.name : tid}: ${r}`))
+      return
+    }
+    if (id === 'status:tidy') {
+      // stale = no commits off main, nothing dirty or ignored, no agent, no thread; plain `git worktree remove`, branch kept
+      await interaction.deferUpdate().catch(() => {})
+      const repo = (access.groups as any)?.[room?.id]?.repo as string | undefined
+      const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+      const map: Record<string, string> = {}
+      for (const t of await roomThreads(room)) map[t.id] = t.name
+      const r = repo && /^[\w.-]+\/[\w.-]+$/.test(repo) ? spawnSync('python3', [join(team, 'tools', 'room-status.py'), repo, '--tidy'],
+        { encoding: 'utf8', timeout: 30000, env: { ...process.env, THREADS: JSON.stringify(map) } }) : null
+      await interaction.editReply({ content: '```\n' + String(r?.stdout || r?.stderr || 'not a repo room').slice(0, 1800) + '\n```', components: [] }).catch(() => {})
+      return
+    }
+    if (id === 'status:close') {
+      if (await interactionCallback(interaction, 4, await closeRoomList(access, room))) return
+      await interaction.deferUpdate().catch(() => {})
+      await interaction.editReply(await closeRoomPicker(access, room)).catch(() => {})
+      return
+    }
+    if (id === 'close:pick' && interaction.isStringSelectMenu()) {
+      closePicked.set(interaction.user.id, interaction.values)
+      const names = interaction.values.map(v => `<#${v}>`).join(', ')
+      await interaction.update({ content: `**Close ${interaction.values.length}:** ${names}\nNothing is deleted: archived threads come back with one message.`,
+        components: [{ type: 1, components: [
+          { type: 2, style: 4, custom_id: 'close:many', label: `Close ${interaction.values.length} ✓` },
+          { type: 2, style: 2, custom_id: 'close:no', label: 'Cancel' }] }] } as any).catch(() => {})
+      return
+    }
+    if (id === 'close:many') {
+      const ids = closePicked.get(interaction.user.id) ?? []
+      closePicked.delete(interaction.user.id)
+      await interaction.deferUpdate().catch(() => {})
+      const lines: string[] = []
+      for (const tid of ids) {
+        const t: any = await client.channels.fetch(tid).catch(() => null)
+        lines.push(t ? `<#${tid}>: ${await closeThread(access, t, who)}` : `<#${tid}>: not found`)
+      }
+      await interaction.editReply({ content: lines.join('\n') || 'nothing picked', components: [] }).catch(() => {})
+      return
+    }
+    return
+  }
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) && interaction.customId.startsWith('work:')) {
+    const w = workPlans.get(interaction.user.id)
+    if (interaction.customId === 'work:no' || !w) { workPlans.delete(interaction.user.id); await interaction.update({ content: w ? 'Cancelled.' : 'This /work expired: type it again.', components: [] }).catch(() => {}); return }
+    if (interaction.isStringSelectMenu()) {
+      await interaction.deferUpdate().catch(() => {})
+      const nw = await workMake(w.repo, interaction.values.filter(v => /^[a-z0-9-]+-oracle$/.test(v)), w.post)
+      workPlans.set(interaction.user.id, nw)
+      await interaction.editReply(workView(loadAccess(), nw)).catch(() => {})
+      return
+    }
+    if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ Work ✓: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    workPlans.delete(interaction.user.id)
+    const ok = workStart(w)
+    await interaction.update({ components: [], content: ok ? `🛠️ working on ${w.repo}${w.souls.length ? ` with ${w.souls.join(', ')}` : ''}: the report lands ${w.post ? 'here' : 'in its room'}` : '⚠️ /work failed to start (work.log)' }).catch(() => {})
+    return
+  }
+  if (interaction.isButton() && interaction.customId.startsWith('archive:')) {
+    const plan = archivePlans.get(interaction.user.id); archivePlans.delete(interaction.user.id)
+    if (interaction.customId === 'archive:no' || !plan) { await interaction.update({ content: plan ? 'Cancelled.' : 'This /archive expired: type it again.', components: [] }).catch(() => {}); return }
+    if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ Archive ✓: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    const ok = archiveStart(plan.repo, plan.un, interaction.user.username)
+    await interaction.update({ components: [], content: ok ? `🗄️ ${plan.un ? 'unarchiving' : 'archiving'} ${plan.repo}: the result line lands in the room` : '⚠️ /archive failed to start (archive.log)' }).catch(() => {})
+    return
+  }
+  // 🎯 Focus (Nat 2026-11-08 "if we new can we focus too? the herdr?" -> "B"): custom_id focus:<owner/repo>|<sub path>.
+  // herdr on this machine focuses the space of that worktree (or the repo's anchor when sub is empty).
+  if (interaction.isButton() && interaction.customId.startsWith('focus:')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) { await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {}); return }
+    const m = /^focus:([\w.-]+\/[\w.-]+)\|([\w./-]*)$/.exec(interaction.customId)
+    if (!m || m[2]!.includes('..')) { await interaction.reply({ content: '⚠️ bad focus target', ephemeral: true }).catch(() => {}); return }
+    const root = join(process.env.GHQ_ROOT || '/opt/Code', 'github.com', m[1]!)
+    const target = m[2] ? join(root, m[2]) : root
+    const r = spawnSync('herdr', ['--session', process.env.HERDR_SESSION || 'laris-co', 'worktree', 'list', '--cwd', root], { encoding: 'utf8', timeout: 10000 })
+    let ws = ''
+    try { const d = JSON.parse(r.stdout).result; ws = (d.worktrees ?? []).find((w: any) => w.path === target)?.open_workspace_id ?? (m[2] ? '' : d.source?.source_workspace_id ?? '') } catch {}
+    if (!ws) { await interaction.reply({ content: `⚠️ no open herdr space for \`${m[2] || m[1]}\``, ephemeral: true }).catch(() => {}); return }
+    const f = spawnSync('herdr', ['--session', process.env.HERDR_SESSION || 'laris-co', 'workspace', 'focus', ws], { encoding: 'utf8', timeout: 10000 })
+    await interaction.reply({ content: f.status === 0 ? `🎯 herdr on m5 → \`${m[2] || m[1]}\` (${ws})` : `⚠️ focus failed: ${String(f.stderr).slice(0, 120)}`, ephemeral: true }).catch(() => {})
+    return
+  }
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('lsx:')) {
+    if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ sleep / wake: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    const verb = interaction.customId === 'lsx:sleep' ? 'sleep' : 'wake'
+    const v = interaction.values[0] ?? ''
+    if (!(verb === 'sleep' ? /^w[\w]+:p\d+$/ : /^[\w.-]+$/).test(v)) { await interaction.reply({ content: '⚠️ bad pick', ephemeral: true }).catch(() => {}); return }
+    const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+    const chat = interaction.channelId
+    const script = `out=$(bash "$TEAM/tools/space-sleep.sh" "$VERB" "$V" 2>&1 | tail -2); "$TEAM/tools/discord-say.sh" "$CHAT" "$(printf '%s %s: %s' "$ICON" "$V" "$out" | head -c 1800)"`
+    try {
+      const o = openSync(join(STATE_DIR, 'sleep.log'), 'a')
+      spawn('bash', ['-lc', script], { detached: true, stdio: ['ignore', o, o], env: { ...process.env, TEAM: team, VERB: verb, V: v, CHAT: chat, ICON: verb === 'sleep' ? '💤' : '☀️' } }).unref()
+      await interaction.reply({ ephemeral: true, content: `${verb === 'sleep' ? '💤 putting' : '☀️ waking'} \`${v}\` ${verb === 'sleep' ? 'to sleep (space stays)' : '(same conversation)'}: result follows here` }).catch(() => {})
+    } catch (e) { await interaction.reply({ ephemeral: true, content: `⚠️ ${e}` }).catch(() => {}) }
+    return
+  }
+  // /promote components (customId promote:souls | promote:go | promote:no); the plan waits in promotePlans per user
+  if ((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('promote:')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const p = promotePlans.get(interaction.user.id)
+    if (!p || interaction.customId === 'promote:no') {
+      promotePlans.delete(interaction.user.id)
+      await interaction.update({ content: p ? 'Cancelled.' : 'This /promote expired: type `/promote` again.', components: [] }).catch(() => {})
+      return
+    }
+    // ♻️ an existing repo picked, or ⚠️ new: the plan is made again with that choice (still only a plan)
+    const use = /^promote:use:(\d)$/.exec(interaction.customId)
+    if (use || interaction.customId === 'promote:new') {
+      await interaction.deferUpdate().catch(() => {})
+      const pick = use ? (p.matches ?? [])[Number(use[1])] : undefined
+      const np = pick ? await promoteMake(p.thread, pick.split('/')[0]!, pick.split('/')[1]!, p.souls)
+        : await promoteMake(p.thread, p.owner, p.name, p.souls, true)
+      promotePlans.set(interaction.user.id, np)
+      await interaction.editReply(promoteView(access, np)).catch(() => {})
+      return
+    }
+    if (interaction.isStringSelectMenu()) {
+      await interaction.deferUpdate().catch(() => {})
+      const np = await promoteMake(p.thread, p.owner, p.name, interaction.values.filter(v => /^[a-z0-9-]+-oracle$/.test(v)), p.fresh)
+      promotePlans.set(interaction.user.id, np)
+      await interaction.editReply(promoteView(access, np)).catch(() => {})
+      return
+    }
+    if (interaction.customId !== 'promote:go') return
+    if (!PROMOTE_GO.includes(interaction.user.id)) {
+      await interaction.reply({ content: '⚠️ Promote ✓ makes a repo and writes access rows: Nat or catbutter only', ephemeral: true }).catch(() => {})
+      return
+    }
+    promotePlans.delete(interaction.user.id)
+    if (!p.ok) { await interaction.update({ content: '⚠️ the plan stopped: type `/promote` again once it is fixed', components: [] }).catch(() => {}); return }
+    const started = promoteStart(p, interaction.user.username)
+    await interaction.update({ components: [], content: started
+      ? `📦 promoting <#${p.thread}>${p.souls.length ? ` with ${p.souls.join(', ')}` : ' (room only)'}: the result lands in the new room; this thread gets a moved-to line, then it is archived`
+      : '⚠️ /promote failed to start (see promote.log)' }).catch(() => {})
+    return
+  }
+  // /soul picker components (customId soul:pick | soul:add:<o> | soul:rm:<o> | soul:ls)
+  if ((interaction.isStringSelectMenu() || interaction.isButton()) && interaction.customId.startsWith('soul:')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const ch: any = interaction.channel
+    const policy = ch ? findGroupPolicy(access, ch) : undefined
+    const repo = roomRepo(access, ch, policy)
+    if (!access.host || !repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+      await interaction.reply({ content: '⚠️ not a repo room', ephemeral: true }).catch(() => {})
+      return
+    }
+    const inThread = !!ch?.isThread?.()
+    const channel = inThread ? ch.parentId as string : interaction.channelId
+    const id = interaction.customId
+    if (interaction.isStringSelectMenu()) {
+      await interaction.update(soulPicker(repo, inThread, ch?.name, interaction.values[0])).catch(() => {})
+      return
+    }
+    if (id === 'soul:ls') {
+      await interaction.deferUpdate().catch(() => {})
+      const r = spawnSync('bash', ['-lc', 'maw soul ls "$REPO" 2>&1 | tail -30'], { encoding: 'utf8', timeout: 20000,
+        env: { ...process.env, REPO: repo } })
+      await interaction.editReply({ content: '```\n' + String(r.stdout || r.stderr || 'no output').slice(0, 1800) + '\n```',
+        components: [] }).catch(() => {})
+      return
+    }
+    const mm = /^soul:(add|rm):([a-z0-9-]+-oracle)$/.exec(id)
+    if (!mm) return
+    const [, verb, o] = mm
+    if (verb === 'rm' && !inThread) {
+      await interaction.update({ content: '⚠️ Remove works inside the thread the soul is in', components: [] }).catch(() => {})
+      return
+    }
+    const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+    try {
+      const out = openSync(join(STATE_DIR, 'soul.log'), 'a')
+      spawn('bash', [join(team, 'tools', 'soul-slash.sh'), verb, o, repo, inThread ? interaction.channelId : '', channel,
+        interaction.channelId], { detached: true, stdio: ['ignore', out, out] }).unref()
+      const icon = soulIcon(o)
+      await interaction.update({ components: [], content: verb === 'add'
+        ? (inThread ? `🧬 ${icon} ${o} joins this thread (every line), Laris goes tag-only, the thread gets ${icon || 'its icon'}`
+          : `🧬 bringing ${icon} ${o} into ${repo} (its own thread)`)
+        : `📤 taking ${icon} ${o} out of this thread; Laris answers again` }).catch(() => {})
+    } catch (e) {
+      await interaction.update({ content: `⚠️ /soul failed to start: ${e}`, components: [] }).catch(() => {})
+    }
     return
   }
   if (!interaction.isButton()) return
@@ -1743,10 +2818,15 @@ function webhookAllowed(msg: Message): boolean {
 
 client.on('messageCreate', msg => {
   if (msg.author.bot && !webhookAllowed(msg)) return
+  catchupSeen.add(msg.id) // laris-co patch (catch-up): live delivery wins over catch-up
+  heartbeatLastGatewayAt = Date.now() // laris-co patch (#95): the gateway delivered something
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
-async function handleInbound(msg: Message): Promise<void> {
+async function handleInbound(msg: Message, missed = false): Promise<void> {
+  // laris-co patch (catch-up): a message replayed after a restart never runs a command again (!sleep, !ears, !!setup…)
+  if (missed && /^\s*!/.test(msg.content.replace(/<@[!&]?\d+>/g, ' '))) return
+  if (!missed) {
   // laris-co patch: "!!setup" runs before the gate, because a new server has no policy yet and the gate would drop it.
   // Only the host acts, only for a trusted human in a plain text channel; everyone else is ignored silently.
   // It never reaches Claude.
@@ -1760,7 +2840,12 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   // laris-co patch (Nat 2026-11-02): "!ears on|off" runs before the gate too, so a deaf bot still hears "!ears on".
-  if (earsHandle(msg)) return
+  if (earsHandle(msg)) { heartbeatNow(); return } // #95: the heartbeat shows the new ears at once
+  // laris-co patch (laris-team #91): "!status" too, so a deaf bot or a denied room still answers a tagged "!status".
+  if (statusHandle(msg)) return
+  // laris-co patch (Nat 2026-11-03): "!sleep" puts the tagged bot to sleep; "!wake" goes to the host only.
+  if (sleepHandle(msg)) return
+  }
 
   const result = await gate(msg)
 
@@ -1777,6 +2862,10 @@ async function handleInbound(msg: Message): Promise<void> {
     }
     return
   }
+
+  // laris-co patch (#95): it passed the gate, so this body heard it
+  heartbeatLastInboundAt = Date.now()
+  heartbeatNow()
 
   let chat_id = msg.channelId
   // laris-co patch: read these before "!here" or a new thread changes the picture.
@@ -1831,8 +2920,16 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
+  // laris-co patch (Nat 2026-11-07: "what if i need like !wt to create new worktree ... and add oracles too?"):
+  // "!wt <name>" in a layout-9 repo channel (the host's row carries `repo`), host only, trusted human only.
+  //   <name> is an oracle with a soul (e.g. neo-oracle) -> maw soul in <oracle> <repo> --deny-main --yes (its own bot, own thread)
+  //   anything else                                   -> maw soul wt <name> <repo> --yes (worktree + thread, forwarded)
+  // "!wt-close <name>" -> maw soul wt-close (unlink + archive; the worktree stays). Runs detached; the result is posted back.
+  if (wtHandle(msg, result.access, roomPolicy)) return
+
   // laris-co patch: "!!<name>" (or "!!thread <name>") = a standalone public thread in this channel (in the parent when typed
-  // inside a thread), opened by the HOST only, with every trusted human added as a member. Other bots ignore it.
+  // inside a thread), opened by the HOST only, with the trusted humans threadOpenMembers() picks added as members.
+  // Other bots ignore it.
   if (msg.channel.type !== ChannelType.DM) {
     const m = /^!!(?:thread\s+)?([^\s!].*)$/i.exec(msg.content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim())
     if (m) {
@@ -1860,7 +2957,10 @@ async function handleInbound(msg: Message): Promise<void> {
         // (unarchived when needed), the same way a summon reuses the oracle's thread; only otherwise a new one opens.
         const old = await namedThread(parent, name)
         const th = old ?? await parent.threads.create({ name, autoArchiveDuration: 10080, type: ChannelType.PublicThread })
-        for (const uid of result.access.allowFrom) await th.members.add(uid).catch(() => {})
+        // laris-co patch (Nat 2026-11-07: "if it crated by me do not add catbutter but if catbutter create please add me"):
+        // the opener is always added; Nat (the owner, first in allowFrom) is added too when someone else opens it.
+        // Nobody else from allowFrom is added.
+        for (const uid of bangThreadMembers(msg.author.id, result.access.allowFrom)) await th.members.add(uid).catch(() => {})
         if (!old) await th.send(`🧵 **${th.name}** · opened by <@${msg.author.id}>`).catch(() => {})
         void msg.react('🧵').catch(() => {})
         void msg.reply({ content: `🧵 <#${th.id}>`, allowedMentions: { parse: [] } }).catch(() => {})
@@ -1984,11 +3084,61 @@ async function handleInbound(msg: Message): Promise<void> {
         ...(context ? { context } : {}),
         ...(newThreads.has(chat_id) ? { thread_new: 'true: name it with rename_thread once you know the topic' } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...(missed ? { missed_while_offline: 'true: sent while this body was restarting; answer it now if it still needs an answer' } : {}),
       },
     },
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
   })
+}
+
+// laris-co patch (catch-up, 2026-11-07, #repo pilot): Discord does not replay messages sent while a body was down, so
+// Nat's two tags to Neo during its restart were lost. On ready, every heard room (access groups) is read back to the
+// previous run's last heartbeat (at most CATCHUP_WINDOW_MS); messages after this bot's own last message go through the
+// normal gate and are delivered with missed_while_offline. At most CATCHUP_PER_ROOM per room, oldest first. The last
+// delivered id per room is kept in catchup.json beside status.json, so a message is never delivered twice.
+const CATCHUP_WINDOW_MS = 10 * 60_000
+const CATCHUP_PER_ROOM = 20
+const CATCHUP_FILE = join(STATE_DIR, 'catchup.json')
+const catchupSeen = new Set<string>()
+
+function catchupSince(prev: typeof catchupPrev, now: number): number {
+  const ts = [prev?.stopped_at, prev?.updated_at, prev?.last_inbound_at, prev?.started_at]
+    .map(t => (t ? Date.parse(t) : NaN)).filter(t => Number.isFinite(t)) as number[]
+  const last = ts.length ? Math.max(...ts) : now - CATCHUP_WINDOW_MS
+  return Math.max(last, now - CATCHUP_WINDOW_MS)
+}
+
+async function catchup(): Promise<void> {
+  const since = catchupSince(catchupPrev, heartbeatStartedAt)
+  let done: Record<string, string> = {}
+  try { done = JSON.parse(readFileSync(CATCHUP_FILE, 'utf8')) } catch {}
+  const rooms = Object.keys(loadAccess().groups ?? {})
+  let delivered = 0
+  for (const room of rooms) {
+    try {
+      const ch = await client.channels.fetch(room).catch(() => null)
+      if (!ch || !('messages' in ch) || typeof (ch as any).messages?.fetch !== 'function') continue
+      const got = await (ch as any).messages.fetch({ limit: 50 }) as Map<string, Message>
+      const list = [...got.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      const mine = list.map(m => m.author.id).lastIndexOf(client.user!.id)
+      const todo = list.slice(mine + 1).filter(m =>
+        m.createdTimestamp > since && m.createdTimestamp < heartbeatStartedAt + 60_000
+        && !(m.author.bot && !webhookAllowed(m))
+        && !catchupSeen.has(m.id)
+        && (!done[room] || BigInt(m.id) > BigInt(done[room]))).slice(-CATCHUP_PER_ROOM)
+      for (const m of todo) {
+        catchupSeen.add(m.id)
+        await handleInbound(m, true)
+        done[room] = m.id
+        delivered++
+      }
+    } catch (err) {
+      process.stderr.write(`discord: catch-up failed for ${room}: ${err}\n`)
+    }
+  }
+  try { writeFileSync(CATCHUP_FILE, JSON.stringify(done, null, 2)) } catch {}
+  if (delivered) process.stderr.write(`discord: catch-up delivered ${delivered} missed message(s)\n`)
 }
 
 // laris-co patch (Nat 2026-11-01: "when first start add bot it nothing sent to any ai?"): when the bot is added to a
@@ -2012,6 +3162,8 @@ client.on('guildCreate', guild => {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  heartbeatNow() // laris-co patch (#95): the first heartbeat, now that bot id and guilds are known
+  void catchup().catch(err => process.stderr.write(`discord: catch-up failed: ${err}\n`))
 })
 
 client.login(TOKEN).catch(err => {
