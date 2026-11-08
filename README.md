@@ -108,7 +108,7 @@ Built by Laris Labs Oracle (an AI agent) for Soul Brews Studio.
 ## Repo room commands (2026-11-08)
 
 `plugins/discord/laris/` holds the repo room features, split out of `server.ts`: `/wt`, `/soul`, `/close`,
-`/status`, `/office`, `/lean`, `/ids`, `/ls` (with 💤 sleep / ☀️ wake), `/work`, `/archive`, `/promote`, and the
+`/status`, `/office`, `/lean`, `/ids`, `/ls` (with 💤 sleep / ☀️ wake), `/work`, `/archive`, `/promote`, `/done`, and the
 🎯 Focus button. They are thin fronts: the work runs in the `maw soul` CLI (laris-co/soul-in-repo) and in the
-laris-team tools (`discord-say.sh`, `soul-slash.sh`, `promote-slash.sh`, `space-sleep.sh`, `room-status.py`),
+laris-team tools (`discord-say.sh`, `soul-slash.sh`, `promote-slash.sh`, `space-sleep.sh`, `done-slash.sh`, `room-status.py`),
 found through `LARIS_TEAM_DIR`. Without those, the commands answer with their errors; the rest of the plugin works.
