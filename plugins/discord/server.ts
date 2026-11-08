@@ -40,7 +40,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir, hostname } from 'os'
 import { closeKind, closePicked, closeRoomList, closeRoomPicker, closeThread, idleMin, installRooms, interactionCallback, leanDetect, leanPlans, officeToggle, roomStatus, roomThreads, soulIcon, soulPicker } from './laris/rooms.ts'
 import { idsText } from './laris/ids.ts'
-import { workMake, workPlans, workRepo, workStart, workView } from './laris/work.ts'
+import { workMake, workPlans, workRepo, workStart, workView, workWake } from './laris/work.ts'
 import { archiveDry, archivePlans, archiveStart, archiveView } from './laris/archive.ts'
 import { PROMOTE_GO, promoteMake, promotePlans, promoteStart, promoteTarget, promoteView } from './laris/promote.ts'
 import { join, sep, basename, dirname } from 'path'
@@ -2375,7 +2375,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       const raw = String(interaction.options.getString('repo') ?? '').trim()
       const chW: any = interaction.channel
       const here = !raw || raw === '.'
-      const repo = here ? (roomRepo(access, chW, chW ? findGroupPolicy(access, chW) : undefined) ?? '') : workRepo(raw)
+      // Nat 2026-11-08 "can i call like /work <#room> from portal": a room mention (or a channel link) = that room's repo
+      const mid = /<#(\d+)>/.exec(raw)?.[1] ?? /discord\.com\/channels\/\d+\/(\d+)/.exec(raw)?.[1]
+      const repo = mid ? String((access.groups as any)?.[mid]?.repo ?? '') : here ? (roomRepo(access, chW, chW ? findGroupPolicy(access, chW) : undefined) ?? '') : workRepo(raw)
       if (!repo) { await interaction.reply({ content: here ? '⚠️ not a repo room: `/work repo:owner/repo`' : '⚠️ `/work repo:` owner/repo or a github.com URL', ephemeral: true }).catch(() => {}); return }
       await interaction.deferReply({ ephemeral: true }).catch(() => {})
       const w = await workMake(repo, [], here ? interaction.channelId : undefined)
@@ -2385,7 +2387,10 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }
     if (interaction.commandName === 'archive') {
       const ch: any = interaction.channel
-      const room = ch?.isThread?.() ? ch.parent : ch
+      // /archive room:<#id> from anywhere (Nat 2026-11-08 "archive <#room> in portal")
+      const rawR = String(interaction.options.getString('room') ?? '')
+      const rid = /<#(\d+)>/.exec(rawR)?.[1] ?? /discord\.com\/channels\/\d+\/(\d+)/.exec(rawR)?.[1] ?? (/^\d{15,22}$/.test(rawR.trim()) ? rawR.trim() : '')
+      const room = rid ? { id: rid } : ch?.isThread?.() ? ch.parent : ch
       const g = (access.groups as any)?.[room?.id]
       if (!g?.repo) { await interaction.reply({ content: '⚠️ /archive works in a repo room', ephemeral: true }).catch(() => {}); return }
       await interaction.deferReply({ ephemeral: true }).catch(() => {})
@@ -2660,6 +2665,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       return
     }
     if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ Work ✓: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    if (interaction.customId === 'work:wake') {
+      const room = Object.entries(loadAccess().groups ?? {}).find(([, g]: any) => g?.layout === 9 && String(g?.repo).toLowerCase() === w.repo.toLowerCase())?.[0]
+      if (!room) { await interaction.reply({ content: `⚠️ ${w.repo} has no room yet: Work ✓ first`, ephemeral: true }).catch(() => {}); return }
+      const souls = workWake(w.repo, room)
+      await interaction.reply({ ephemeral: true, content: souls.length ? `☀️ waking ${souls.join(', ')} in <#${room}>: each posts its line there` : 'nothing asleep' }).catch(() => {})
+      return
+    }
     workPlans.delete(interaction.user.id)
     const ok = workStart(w)
     await interaction.update({ components: [], content: ok ? `🛠️ working on ${w.repo}${w.souls.length ? ` with ${w.souls.join(', ')}` : ''}: the report lands ${w.post ? 'here' : 'in its room'}` : '⚠️ /work failed to start (work.log)' }).catch(() => {})
