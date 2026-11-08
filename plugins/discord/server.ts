@@ -1233,6 +1233,19 @@ export function roomRepo(access: Access, ch: any, policy?: any): string | undefi
 // /ls sleep + wake menus (Nat 2026-11-08 "if /ls button can we list button to sleep / wake"): worktree agents that are
 // idle/done can sleep (tools/space-sleep.sh: wake card, /exit, the space stays); sleepers of this session can wake.
 // The host body never appears. Picking runs at once (Nat or catbutter), detached.
+export const doneRoom = new Map<string, any[]>()   // /done in a room: the threads it will finish, by user id
+export function doneItem(access: Access, t: any): any {
+  const k = closeKind(access, t)
+  if (k.refuse) return null
+  const row = (access.groups as any)?.[t.parentId]
+  const soulByRow = Object.entries(row?.threads ?? {}).find(([, x]) => x === t.id)?.[0] as string | undefined
+  const kind = k.wt ? 'wt' : (k.soul || soulByRow) ? 'soul' : 'plain'
+  const name = k.wt ?? k.soul ?? soulByRow ?? '-'
+  return { kind, repo: k.repo ?? row?.repo ?? '-', name, thread: t.id, room: t.parentId,
+    line: kind === 'wt' ? `🌱 \`${name}\`: PR if work left, else close + remove` : kind === 'soul' ? `🧬 ${name}: 💤 sleep + archive` : '🧵 archive' }
+}
+export const donePlans = new Map<string, { kind: string; repo: string; name: string; thread: string; room: string }>()   // /done, by user id
+
 export function lsSleepMenus(): any[] {
   const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
   const rows: any[] = []
@@ -2300,6 +2313,43 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     // /archive (Nat 2026-11-08 "we should have archive to handle this"): put a finished repo room away (laris/archive.ts)
     // /ls (Nat 2026-11-08 "can we list ? wt like from /status ? oh can you have maw ls?"): herdr spaces on m5 as maw ls
     // prints them (repo → worktrees, ● = agent running). In a repo room only that repo's block; all: every repo.
+    // /done (Nat 2026-11-08 "what you think if we have /done?" -> "make /done"): in a thread, finish properly then close.
+    // worktree: work left -> its agent commits, pushes, opens a PR; nothing left -> wt-close + worktree removed.
+    // soul: its body sleeps, thread archived. plain: archived. Plan only for the caller, then Done ✓ (tools/done-slash.sh).
+    if (interaction.commandName === 'done') {
+      const ch: any = interaction.channel
+      // in the room (Nat 2026-11-08, /done typed in the room): every open thread gets its own /done; the room stays
+      if (!ch?.isThread?.()) {
+        if (!(access.groups as any)?.[ch?.id]?.repo) { await interaction.reply({ content: '⚠️ `/done` works in a repo room or one of its threads', ephemeral: true }).catch(() => {}); return }
+        await interaction.deferReply({ ephemeral: true }).catch(() => {})
+        const ts = (await roomThreads(ch)).filter((t: any) => String(t.name).toLowerCase() !== 'office')
+        const items = ts.map((t: any) => doneItem(access, t)).filter((x: any) => x)
+        doneRoom.set(interaction.user.id, items)
+        await interaction.editReply({ content: items.length ? `**Done with every thread here?** (only you see this)\n` + items.map((x: any) => `- <#${x.thread}> ${x.line}`).join('\n').slice(0, 1700) + '\nThe office and the room stay. Nothing is deleted.' : '✨ no open threads to finish (the office stays)',
+          components: items.length ? [{ type: 1, components: [{ type: 2, style: 3, custom_id: 'done:room', label: `Done ✓ (${items.length})` }, { type: 2, style: 2, custom_id: 'done:no', label: 'Cancel' }] }] : [] } as any).catch(() => {})
+        return
+      }
+      const k = closeKind(access, ch)
+      if (k.refuse) { await interaction.reply({ content: `⚠️ ${k.refuse.replace('/close', '/done')}`, ephemeral: true }).catch(() => {}); return }
+      const row = (access.groups as any)?.[ch.parentId]
+      const soulByRow = Object.entries(row?.threads ?? {}).find(([, t]) => t === ch.id)?.[0] as string | undefined
+      const kind = k.wt ? 'wt' : (k.soul || soulByRow) ? 'soul' : 'plain'
+      const name = k.wt ?? k.soul ?? soulByRow ?? '-'
+      const repo = k.repo ?? row?.repo ?? '-'
+      let state = ''
+      if (kind === 'wt') {
+        const W = join(process.env.GHQ_ROOT || '/opt/Code', 'github.com', repo, 'wt', name)
+        const d = spawnSync('git', ['-C', W, 'status', '--porcelain'], { encoding: 'utf8' }).stdout.split('\n').filter(Boolean).length
+        const a = Number(spawnSync('git', ['-C', W, 'rev-list', '--count', 'origin/HEAD..HEAD'], { encoding: 'utf8' }).stdout.trim() || 0)
+        state = d || a ? `has work: ${d} uncommitted, ${a} not on main → its agent commits, pushes, opens a PR; the thread stays until merged`
+          : 'nothing left → unlink, archive this thread, remove the worktree (branch kept)'
+      }
+      const what = kind === 'wt' ? `🌱 worktree \`${name}\`: ${state}` : kind === 'soul' ? `🧬 ${name}: its body 💤 sleeps (/ls ☀️ wakes it), this thread is archived` : '🧵 plain thread: a done line, then archived'
+      donePlans.set(interaction.user.id, { kind, repo, name, thread: ch.id, room: ch.parentId })
+      await interaction.reply({ ephemeral: true, content: `**Done with this thread?** (only you see this)\n${what}\nNothing is deleted.`,
+        components: [{ type: 1, components: [{ type: 2, style: 3, custom_id: 'done:go', label: 'Done ✓' }, { type: 2, style: 2, custom_id: 'done:no', label: 'Cancel' }] }] } as any).catch(() => {})
+      return
+    }
     if (interaction.commandName === 'ls') {
       // Nat 2026-11-08 "no show all in herdr? and mark current session": every space, and this room's repo marked 👉
       await interaction.deferReply({ ephemeral: true }).catch(() => {})
@@ -2359,6 +2409,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         '`/office` open the office, or close it with a summary here',
         '`/lean` detect idle threads, a quiet office, stale wts; one Lean ✓ closes them',
         '`/ids` every id ↔ name (rooms, threads, people, bots) · `/ids find:dustboy`',
+        '`/done` in a thread: finish it properly (wt → commit/PR, soul → 💤 sleep), then archive',
         '`/work repo:` a repo (or GitHub URL): its room + a report + souls',
         '`/archive` put a finished repo room away (souls out, threads archived, room to 🗄️ Archive) · again = bring back',
         '`/promote` in a talk thread: it becomes a repo + its own room (plan first, then Promote ✓)',
@@ -2652,6 +2703,33 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       spawn('bash', ['-lc', script], { detached: true, stdio: ['ignore', o, o], env: { ...process.env, TEAM: team, VERB: verb, V: v, CHAT: chat, ICON: verb === 'sleep' ? '💤' : '☀️' } }).unref()
       await interaction.reply({ ephemeral: true, content: `${verb === 'sleep' ? '💤 putting' : '☀️ waking'} \`${v}\` ${verb === 'sleep' ? 'to sleep (space stays)' : '(same conversation)'}: result follows here` }).catch(() => {})
     } catch (e) { await interaction.reply({ ephemeral: true, content: `⚠️ ${e}` }).catch(() => {}) }
+    return
+  }
+  if (interaction.isButton() && interaction.customId === 'done:room') {
+    const items = doneRoom.get(interaction.user.id); doneRoom.delete(interaction.user.id)
+    if (!items) { await interaction.update({ content: 'This /done expired: type it again.', components: [] }).catch(() => {}); return }
+    if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ Done ✓: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+    const script = 'while IFS=$(printf "\\t") read -r k r n t m; do bash "$TEAM/tools/done-slash.sh" "$k" "$r" "$n" "$t" "$m" "$WHO"; done <<< "$LIST"'
+    try {
+      const o = openSync(join(STATE_DIR, 'done.log'), 'a')
+      spawn('bash', ['-c', script], { detached: true, stdio: ['ignore', o, o], env: { ...process.env, TEAM: team, WHO: interaction.user.username,
+        LIST: items.map((x: any) => [x.kind, x.repo, x.name, x.thread, x.room].join('\t')).join('\n') } }).unref()
+      await interaction.update({ components: [], content: `✅ finishing ${items.length} thread(s): results follow in the room` }).catch(() => {})
+    } catch (e) { await interaction.update({ components: [], content: `⚠️ /done failed to start: ${e}` }).catch(() => {}) }
+    return
+  }
+  if (interaction.isButton() && interaction.customId.startsWith('done:')) {
+    const d = donePlans.get(interaction.user.id); donePlans.delete(interaction.user.id)
+    if (interaction.customId === 'done:no' || !d) { await interaction.update({ content: d ? 'Cancelled.' : 'This /done expired: type it again.', components: [] }).catch(() => {}); return }
+    if (!PROMOTE_GO.includes(interaction.user.id)) { await interaction.reply({ content: '⚠️ Done ✓: Nat or catbutter only', ephemeral: true }).catch(() => {}); return }
+    const team = process.env.LARIS_TEAM_DIR || '/opt/Code/github.com/laris-co/laris-team'
+    try {
+      const o = openSync(join(STATE_DIR, 'done.log'), 'a')
+      spawn('bash', [join(team, 'tools', 'done-slash.sh'), d.kind, d.repo, d.name, d.thread, d.room, interaction.user.username],
+        { detached: true, stdio: ['ignore', o, o] }).unref()
+      await interaction.update({ components: [], content: '✅ on it: the result follows here (or in the room once this thread is archived)' }).catch(() => {})
+    } catch (e) { await interaction.update({ components: [], content: `⚠️ /done failed to start: ${e}` }).catch(() => {}) }
     return
   }
   // /promote components (customId promote:souls | promote:go | promote:no); the plan waits in promotePlans per user
