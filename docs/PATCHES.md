@@ -197,4 +197,4 @@ access:
   renames it to `.used` before merging. Answered by the plugin, never forwarded to Claude. Only allowFrom can type it,
   and only the person who typed it can press it. Register the command once per guild (POST, not PUT — PUT replaces all):
   `{"name":"merge","description":"Merge a helper's PR (plan first)","options":[{"type":4,"name":"issue","description":"issue number","required":true,"autocomplete":true}]}`
-- Limit: a guard-rail, not a lock — the house's own gh account can still merge. A lock needs branch protection.
+- Limits (ferris 12 Nov): a guard-rail, not a lock — the house's own gh account can still merge, and helper.sh does not check who wrote the approval file. A lock needs branch protection. Answers only in a room listed in this body's access.groups (two bodies on one token would each merge their own #N). House checkout only: helpers in a project repo cannot be /merged yet.

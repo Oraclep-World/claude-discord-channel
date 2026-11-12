@@ -6,6 +6,8 @@
 // `bash /abs/path/helper.sh` merged with no press (ferris 12 Nov 13:3x). Here the press itself makes the approval.
 // Honest limit (ferris 14:1x): the house's gh account can merge anyway — this is a guard-rail for a careless AI,
 // not a lock against one that means to merge. A lock needs branch protection (paid plan or public repos).
+// Also (ferris 14:2x): helper.sh does not check who wrote the approval file — the same user (so Claude too) can write one.
+// Scope: the house's own checkout only (houseDir); a helper in a project repo (foodydev → ~/foodyos) cannot be /merged yet.
 import { spawn } from 'child_process'
 import { randomBytes } from 'crypto'
 import { mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'fs'

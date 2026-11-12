@@ -2235,7 +2235,12 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     // Oraclep-World patch (Pleam 2026-11-12 "เอาปุ่มในห้องแบบพี่นัท"): /merge issue:<N> — the plan for the caller only,
     // then Merge ✓ (handled below). Answered by the plugin, never forwarded to Claude (oraclep/merge.ts).
     if (interaction.commandName === 'merge') {
-      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      // ferris 12 Nov 14:2x: two bodies on one bot token both see the command, so each would merge ITS OWN issue #N.
+      // Answer only in a room this body owns (access.groups), and only if this body won the reply.
+      const chM: any = interaction.channel
+      const roomM = chM?.isThread?.() ? chM.parentId : interaction.channelId
+      if (!(access.groups as any)?.[roomM]) { await interaction.reply({ content: '⚠️ `/merge` works only in this house\'s own room', ephemeral: true }).catch(() => {}); return }
+      if (!await interaction.deferReply({ ephemeral: true }).then(() => true, () => false)) return
       const m = await mergeMake(Number(interaction.options.getInteger('issue') ?? 0))
       if (!m.plan) { await interaction.editReply({ content: '⚠️ ' + (m.error ?? 'no plan') }).catch(() => {}); return }
       mergePlans.set(interaction.user.id, { plan: m.plan, at: Date.now() })
