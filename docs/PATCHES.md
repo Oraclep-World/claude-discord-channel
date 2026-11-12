@@ -187,3 +187,14 @@ access:
   - It is handled before the gate, so a deaf bot still hears `!ears on`, and it never reaches Claude. Untrusted senders
     are ignored silently. Static mode (`DISCORD_ACCESS_MODE=static`) never reads `access.local.json`: the bot reacts ⚠️.
   - `bun tests/ears-test.ts` checks the file logic on a scratch dir (it runs the `ears:begin`…`ears:end` block of `server.ts`).
+
+## Oraclep-World additions
+
+- **`/merge issue:<N>`** (Pleam 12 Nov 2026, `plugins/discord/oraclep/merge.ts`): in a house's room, shows the caller only
+  the helper PR for issue N (`helper.sh plan N`: title, commit, size) with **Merge ✓ / Cancel**. Merge ✓ writes a one-time
+  approval file to `~/.claude/channels/approvals/<id>.json` (repo, issue, PR, exact commit, time) and runs
+  `helper.sh finish N --sha <commit> --approved-by-button <id>`; helper.sh checks the file (≤ 5 min, same commit) and
+  renames it to `.used` before merging. Answered by the plugin, never forwarded to Claude. Only allowFrom can type it,
+  and only the person who typed it can press it. Register the command once per guild (POST, not PUT — PUT replaces all):
+  `{"name":"merge","description":"Merge a helper's PR (plan first)","options":[{"type":4,"name":"issue","description":"issue number","required":true,"autocomplete":true}]}`
+- Limit: a guard-rail, not a lock — the house's own gh account can still merge. A lock needs branch protection.

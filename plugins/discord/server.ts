@@ -43,6 +43,7 @@ import { idsText } from './laris/ids.ts'
 import { workMake, workPlans, workRepo, workStart, workView, workWake } from './laris/work.ts'
 import { archiveDry, archivePlans, archiveStart, archiveView } from './laris/archive.ts'
 import { PROMOTE_GO, promoteMake, promotePlans, promoteStart, promoteTarget, promoteView } from './laris/promote.ts'
+import { mergeChoices, mergeGo, mergeMake, mergePlans, mergeView } from './oraclep/merge.ts'
 import { join, sep, basename, dirname } from 'path'
 
 export const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -2201,6 +2202,11 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   if (interaction.isAutocomplete()) {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) { await interaction.respond([]).catch(() => {}); return }
+    // Oraclep-World patch: /merge issue: suggests this house's open helpers (oraclep/merge.ts)
+    if (interaction.commandName === 'merge') {
+      await interaction.respond(await mergeChoices(String(interaction.options.getFocused() ?? '').toLowerCase())).catch(() => {})
+      return
+    }
     const ch: any = interaction.channel
     const policy = ch ? findGroupPolicy(access, ch) : undefined
     const repo = roomRepo(access, ch, policy)
@@ -2224,6 +2230,16 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    // Oraclep-World patch (Pleam 2026-11-12 "เอาปุ่มในห้องแบบพี่นัท"): /merge issue:<N> — the plan for the caller only,
+    // then Merge ✓ (handled below). Answered by the plugin, never forwarded to Claude (oraclep/merge.ts).
+    if (interaction.commandName === 'merge') {
+      await interaction.deferReply({ ephemeral: true }).catch(() => {})
+      const m = await mergeMake(Number(interaction.options.getInteger('issue') ?? 0))
+      if (!m.plan) { await interaction.editReply({ content: '⚠️ ' + (m.error ?? 'no plan') }).catch(() => {}); return }
+      mergePlans.set(interaction.user.id, { plan: m.plan, at: Date.now() })
+      await interaction.editReply(mergeView(m.plan)).catch(() => {})
       return
     }
     // laris-co patch (Nat 2026-11-07, "go slash /wt but prevent this" = "The application did not respond"):
@@ -2703,6 +2719,22 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     workPlans.delete(interaction.user.id)
     const ok = workStart(w)
     await interaction.update({ components: [], content: ok ? `🛠️ working on ${w.repo}${w.souls.length ? ` with ${w.souls.join(', ')}` : ''}: the report lands ${w.post ? 'here' : 'in its room'}` : '⚠️ /work failed to start (work.log)' }).catch(() => {})
+    return
+  }
+  // Oraclep-World patch: Merge ✓ / Cancel of /merge. The pending plan is per user, so only the one who typed /merge
+  // can press it, and only someone in allowFrom could type it. The approval file is written only here, after the press.
+  if (interaction.isButton() && interaction.customId.startsWith('merge:')) {
+    const pend = mergePlans.get(interaction.user.id); mergePlans.delete(interaction.user.id)
+    if (interaction.customId === 'merge:no' || !pend) { await interaction.update({ content: pend ? 'Cancelled. Nothing merged.' : 'This /merge expired: type it again.', components: [] }).catch(() => {}); return }
+    if (!loadAccess().allowFrom.includes(interaction.user.id)) { await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {}); return }
+    const p = pend.plan
+    await interaction.update({ components: [], content: `⏳ merging ${p.repo} PR #${p.number} at \`${p.headRefOid.slice(0, 8)}\`…` }).catch(() => {})
+    const r = await mergeGo(p, pend.at, interaction.user.id)
+    await interaction.editReply({ content: (r.ok ? '✅ ' : '⚠️ ') + '```\n' + r.text.replace(/```/g, "'''") + '\n```' }).catch(() => {})
+    const ch: any = interaction.channel
+    await ch?.send?.({ allowedMentions: { parse: [] }, content: r.ok
+      ? `✅ merged ${p.repo} PR #${p.number} (\`${p.headRefOid.slice(0, 8)}\`, issue #${p.issue}) — <@${interaction.user.id}> pressed Merge ✓`
+      : `⚠️ /merge of ${p.repo} PR #${p.number} stopped — nothing merged unless the lines above say so` }).catch(() => {})
     return
   }
   if (interaction.isButton() && interaction.customId.startsWith('archive:')) {
