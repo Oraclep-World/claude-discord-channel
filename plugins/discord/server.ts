@@ -43,7 +43,7 @@ import { idsText } from './laris/ids.ts'
 import { workMake, workPlans, workRepo, workStart, workView, workWake } from './laris/work.ts'
 import { archiveDry, archivePlans, archiveStart, archiveView } from './laris/archive.ts'
 import { PROMOTE_GO, promoteMake, promotePlans, promoteStart, promoteTarget, promoteView } from './laris/promote.ts'
-import { mergeChoices, mergeGo, mergeMake, mergePlans, mergeView } from './oraclep/merge.ts'
+import { mergeAskId, mergeAskView, mergeAsks, mergeChoices, mergeGo, mergeMake, mergePlans, mergeView } from './oraclep/merge.ts'
 import { join, sep, basename, dirname } from 'path'
 
 export const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -1955,6 +1955,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'merge_ask',
+      description: 'Oraclep-World: post a helper PR (by its issue number) into the room with a Merge ✓ button, so Pleam only presses — no /merge to type. You only ask: the merge runs when HE presses (allowFrom only). Use it once the helper PR is ready and you have read it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'the room or thread to post in' },
+          issue: { type: 'number', description: 'the helper issue number (helper.sh list)' },
+        },
+        required: ['chat_id', 'issue'],
+      },
+    },
+    {
       name: 'react',
       description: 'Add an emoji reaction to a Discord message. Unicode emoji work directly; custom emoji need the <:name:id> form.',
       inputSchema: {
@@ -2113,6 +2125,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                 })
                 .join('\n')
         return { content: [{ type: 'text', text: out }] }
+      }
+      case 'merge_ask': {
+        const ch: any = await fetchAllowedChannel(args.chat_id as string)
+        const m = await mergeMake(Number(args.issue))
+        if (!m.plan) throw new Error(m.error ?? 'no plan')
+        if (m.plan.state !== 'OPEN') throw new Error(`PR #${m.plan.number} is ${m.plan.state}: nothing to ask`)
+        const id = mergeAskId()
+        mergeAsks.set(id, { plan: m.plan, at: Date.now() })
+        const sent = await ch.send({ allowedMentions: { parse: [] }, ...mergeAskView(m.plan, id) })
+        return { content: [{ type: 'text', text: `asked: ${m.plan.repo} PR #${m.plan.number} at ${m.plan.headRefOid.slice(0, 8)} (message ${sent.id}); the merge runs only when Pleam presses` }] }
       }
       case 'react': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
@@ -2728,6 +2750,27 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   }
   // Oraclep-World patch: Merge ✓ / Cancel of /merge. The pending plan is per user, so only the one who typed /merge
   // can press it, and only someone in allowFrom could type it. The approval file is written only here, after the press.
+  // merge_ask buttons (posted in the room by the plugin, not ephemeral): merge:ask:<id> / merge:askno:<id>
+  const ask = interaction.isButton() ? /^merge:(ask|askno):([0-9a-f]{16})$/.exec(interaction.customId) : null
+  if (ask) {
+    if (!loadAccess().allowFrom.includes(interaction.user.id)) { await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {}); return }
+    const pend = mergeAsks.get(ask[2]!); mergeAsks.delete(ask[2]!)
+    if (!pend) { await interaction.update({ components: [], content: 'This ask expired (the bot restarted): type /merge' }).catch(() => {}); return }
+    const old = pend.plan
+    if (ask[1] === 'askno') { await interaction.update({ components: [], content: `⏸️ not now — ${old.repo} PR #${old.number} left as it is. Nothing merged.` }).catch(() => {}); return }
+    await interaction.update({ components: [], content: `⏳ merging ${old.repo} PR #${old.number} at \`${old.headRefOid.slice(0, 8)}\`…` }).catch(() => {})
+    const now = await mergeMake(old.issue)
+    let r: { ok: boolean; text: string }
+    if (!now.plan) r = { ok: false, text: now.error ?? 'no plan' }
+    else if (now.plan.headRefOid !== old.headRefOid) r = { ok: false, text: `PR #${old.number} changed after the ask (${old.headRefOid.slice(0, 8)} → ${now.plan.headRefOid.slice(0, 8)}). Nothing merged: read it again, then ask again or type /merge.` }
+    else r = await mergeGo(now.plan, Date.now(), interaction.user.id)
+    await interaction.editReply({ content: (r.ok ? '✅ ' : '⚠️ ') + '```\n' + r.text.replace(/```/g, "'''") + '\n```' }).catch(() => {})
+    const chA: any = interaction.channel
+    await chA?.send?.({ allowedMentions: { parse: [] }, content: r.ok
+      ? `✅ merged ${old.repo} PR #${old.number} (\`${old.headRefOid.slice(0, 8)}\`, issue #${old.issue}) — <@${interaction.user.id}> pressed Merge ✓`
+      : `⚠️ merge of ${old.repo} PR #${old.number} stopped — nothing merged unless the lines above say so` }).catch(() => {})
+    return
+  }
   if (interaction.isButton() && interaction.customId.startsWith('merge:')) {
     const pend = mergePlans.get(interaction.user.id); mergePlans.delete(interaction.user.id)
     if (interaction.customId === 'merge:no' || !pend) { await interaction.update({ content: pend ? 'Cancelled. Nothing merged.' : 'This /merge expired: type it again.', components: [] }).catch(() => {}); return }

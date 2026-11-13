@@ -198,3 +198,7 @@ access:
   and only the person who typed it can press it. Register the command once per guild (POST, not PUT — PUT replaces all):
   `{"name":"merge","description":"Merge a helper's PR (plan first)","options":[{"type":4,"name":"issue","description":"issue number","required":true,"autocomplete":true}]}`
 - Limits (ferris 12 Nov): a guard-rail, not a lock — the house's own gh account can still merge, and helper.sh does not check who wrote the approval file. A lock needs branch protection. Answers only in a room listed in this body's access.groups (two bodies on one token would each merge their own #N). House checkout only: helpers in a project repo cannot be /merged yet.
+- **`merge_ask` tool** (Pleam 13 Nov 2026 13:31 "ไม่ต้องให้ผมพิมพ์ /merge"): the head calls `merge_ask(chat_id, issue)` and
+  the plugin posts the same plan into the room with **Merge ✓ / Not now**. Only allowFrom can press, one press per ask.
+  At press time the plan is made again and must show the same commit, else nothing is merged. Asks live in memory:
+  a bot restart turns an old button into "expired: type /merge".

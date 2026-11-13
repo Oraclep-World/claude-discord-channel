@@ -89,3 +89,20 @@ export async function mergeGo(p: MergePlan, at: number, userId: string): Promise
   const r = await run(['finish', String(p.issue), '--sha', p.headRefOid, '--approved-by-button', id], 240000)
   return { ok: r.code === 0, text: (r.out + (r.err ? '\n' + r.err : '')).trim().slice(0, 1700) || `exit ${r.code}` }
 }
+
+// Pleam 2026-11-13 13:31 "ให้ถาม merge ผมโดยไม่ต้องให้ผมพิมพ์ /merge": the head calls the MCP tool `merge_ask`
+// and the plugin posts the plan with Merge ✓ into the room. The head only ASKS; the press is still Pleam's, and the
+// approval file is still written by the plugin after the press. At press time the plan is made again and must show
+// the same commit as the posted one, so a PR that changed after the ask is never merged on the old question.
+export const mergeAsks = new Map<string, { plan: MergePlan; at: number }>()   // by ask id, one press each
+
+export function mergeAskView(p: MergePlan, id: string): any {
+  const v = mergeView(p)
+  v.content = v.content.replace(' (only you see this)', '') + '\n-# only Pleam can press · the head cannot merge by itself'
+  v.components = p.state === 'OPEN' ? [{ type: 1, components: [
+    { type: 2, style: 3, custom_id: `merge:ask:${id}`, label: `Merge ✓ ${p.headRefOid.slice(0, 7)}` },
+    { type: 2, style: 2, custom_id: `merge:askno:${id}`, label: 'Not now' }] }] : []
+  return v
+}
+
+export function mergeAskId(): string { return randomBytes(8).toString('hex') }
